@@ -1,52 +1,73 @@
 #!/usr/bin/env node
 
-// Parse CLI arguments
-const args = process.argv.slice(2);
-const cliArgs: Record<string, string> = {};
+import {
+  getConfig,
+  ENABLE_DYNAMIC_API_URL,
+  GITLAB_AUTH_COOKIE_PATH,
+  GITLAB_CA_CERT_PATH,
+  GITLAB_JOB_TOKEN,
+  GITLAB_MCP_OAUTH,
+  GITLAB_OAUTH_APP_ID,
+  GITLAB_OAUTH_SCOPES,
+  GITLAB_PERSONAL_ACCESS_TOKEN,
+  GITLAB_POOL_MAX_SIZE,
+  GITLAB_READ_ONLY_MODE,
+  GITLAB_TOOLSETS_RAW,
+  GITLAB_TOOLS_RAW,
+  HOST,
+  HTTP_PROXY,
+  HTTPS_PROXY,
+  IS_OLD,
+  MCP_SERVER_URL,
+  NODE_TLS_REJECT_UNAUTHORIZED,
+  NO_PROXY,
+  PORT,
+  REMOTE_AUTHORIZATION,
+  SESSION_TIMEOUT_SECONDS,
+  SSE,
+  STREAMABLE_HTTP,
+  USE_GITLAB_WIKI,
+  USE_MILESTONE,
+  USE_OAUTH,
+  USE_PIPELINE,
+  GITLAB_TOOL_POLICY_APPROVE_RAW,
+  GITLAB_TOOL_POLICY_HIDDEN_RAW,
+} from "./config.js";
 
-for (let i = 0; i < args.length; i++) {
-  const arg = args[i];
-  if (arg.startsWith('--')) {
-    const [key, value] = arg.slice(2).split('=');
-    if (value) {
-      cliArgs[key] = value;
-    } else if (i + 1 < args.length && !args[i + 1].startsWith('--')) {
-      cliArgs[key] = args[++i];
-    }
-  }
-}
-
-// Helper function to get config value (CLI args take precedence over env vars)
-function getConfig(cliKey: string, envKey: string): string | undefined;
-function getConfig(cliKey: string, envKey: string, defaultValue: string): string;
-function getConfig(cliKey: string, envKey: string, defaultValue?: string): string | undefined {
-  return cliArgs[cliKey] || process.env[envKey] || defaultValue;
-}
-
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { AsyncLocalStorage } from "node:async_hooks";
-import express, { Request, Response } from "express";
+import express, { NextFunction, Request, Response } from "express";
 import fetchCookie from "fetch-cookie";
 import fs from "node:fs";
 import os from "node:os";
-import { HttpProxyAgent } from "http-proxy-agent";
-import { HttpsProxyAgent } from "https-proxy-agent";
 import nodeFetch from "node-fetch";
 import path, { dirname } from "node:path";
-import { SocksProxyAgent } from "socks-proxy-agent";
 import { CookieJar, parse as parseCookie } from "tough-cookie";
 import { fileURLToPath, URL } from "node:url";
 import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
-import { initializeOAuth } from "./oauth.js";
+import { initializeOAuthClient, GitLabOAuth } from "./oauth.js";
+import { createGitLabOAuthProvider } from "./oauth-proxy.js";
+import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { normalizeGitLabApiUrl } from "./utils/url.js";
+import { estimateMergeCommitCount, filterDiffsByPatterns, summarizeWebhookEvents } from "./utils/helpers.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { GitLabClientPool } from "./gitlab-client-pool.js";
-// Add type imports for proxy agents
-import { Agent } from "node:http";
-import { Agent as HttpsAgent } from "node:https";
+import {
+  allTools,
+  readOnlyTools,
+  destructiveTools,
+  parseEnabledToolsets,
+  parseIndividualTools,
+  buildFeatureFlagOverrides,
+  isToolInEnabledToolset,
+  TOOLSET_DEFINITIONS,
+  ALL_TOOLSET_IDS,
+  type ToolsetId,
+} from "./tools/registry.js";
 import {
   BulkPublishDraftNotesSchema,
   CancelPipelineJobSchema,
@@ -71,7 +92,9 @@ import {
   CreateRepositoryOptionsSchema,
   CreateRepositorySchema,
   CreateWikiPageSchema,
+  CreateGroupWikiPageSchema,
   DeleteDraftNoteSchema,
+  DeleteGroupWikiPageSchema,
   DeleteIssueLinkSchema,
   DeleteIssueSchema,
   DeleteLabelSchema,
@@ -94,6 +117,8 @@ import {
   GetMilestoneBurndownEventsSchema,
   GetMilestoneIssuesSchema,
   GetMilestoneMergeRequestsSchema,
+  GetDeploymentSchema,
+  GetEnvironmentSchema,
   GetNamespaceSchema,
   // pipeline job schemas
   GetPipelineJobOutputSchema,
@@ -139,13 +164,15 @@ import {
   GitLabMergeRequestSchema,
   type GitLabMilestones,
   GitLabMilestonesSchema,
-  type GitLabNamespace,
-  type GitLabNamespaceExistsResponse,
   GitLabNamespaceExistsResponseSchema,
   GitLabNamespaceSchema,
   type GitLabPipeline,
   type GitLabPipelineJob,
+  type GitLabDeployment,
+  type GitLabEnvironment,
   GitLabPipelineJobSchema,
+  GitLabDeploymentSchema,
+  GitLabEnvironmentSchema,
   GitLabPipelineSchema,
   type GitLabPipelineTriggerJob,
   GitLabPipelineTriggerJobSchema,
@@ -157,12 +184,12 @@ import {
   GitLabReferenceSchema,
   type GitLabRepository,
   GitLabRepositorySchema,
+  GitLabSearchBlobResultSchema,
+  type GitLabSearchBlobResult,
   type GitLabSearchResponse,
   GitLabSearchResponseSchema,
-  type GitLabTree,
   type GitLabTreeItem,
   GitLabTreeItemSchema,
-  GitLabTreeSchema,
   type GitLabUser,
   GitLabUserSchema,
   type GitLabUsersResponse,
@@ -180,6 +207,8 @@ import {
   ListIssuesSchema,
   ListLabelsSchema,
   ListMergeRequestDiffsSchema, // Added
+  GetMergeRequestFileDiffSchema,
+  ListMergeRequestChangedFilesSchema,
   ListMergeRequestDiscussionsSchema,
   ListMergeRequestsSchema,
   ListMergeRequestVersionsSchema,
@@ -193,6 +222,10 @@ import {
   ListPipelineJobsSchema,
   type ListPipelinesOptions,
   ListPipelinesSchema,
+  type ListDeploymentsOptions,
+  ListDeploymentsSchema,
+  type ListEnvironmentsOptions,
+  ListEnvironmentsSchema,
   type ListPipelineTriggerJobsOptions,
   ListPipelineTriggerJobsSchema,
   type ListProjectMembersOptions,
@@ -201,16 +234,27 @@ import {
   ListProjectsSchema,
   ListWikiPagesOptions,
   ListWikiPagesSchema,
+  GetGroupWikiPageSchema,
+  ListGroupWikiPagesSchema,
+  UpdateGroupWikiPageSchema,
+  type ListGroupWikiPagesOptions,
   MarkdownUploadSchema,
   DownloadAttachmentSchema,
+  DownloadJobArtifactsSchema,
+  GetJobArtifactFileSchema,
+  type GitLabArtifactEntry,
+  GitLabArtifactEntrySchema,
+  ListJobArtifactsSchema,
   MergeMergeRequestSchema,
   ApproveMergeRequestSchema,
   UnapproveMergeRequestSchema,
   GetMergeRequestApprovalStateSchema,
+  GetMergeRequestConflictsSchema,
+  GitLabMergeRequestApprovalsResponseSchema,
   GitLabMergeRequestApprovalStateSchema,
+  type GitLabApprovalUser,
   type GitLabMergeRequestApprovalState,
   type MergeRequestThreadPosition,
-  type MergeRequestThreadPositionCreate,
   type MyIssuesOptions,
   MyIssuesSchema,
   type PaginatedDiscussionsResponse,
@@ -222,6 +266,9 @@ import {
   PushFilesSchema,
   RetryPipelineJobSchema,
   RetryPipelineSchema,
+  SearchCodeSchema,
+  SearchGroupCodeSchema,
+  SearchProjectCodeSchema,
   SearchRepositoriesSchema,
   UpdateDraftNoteSchema,
   UpdateIssueNoteSchema,
@@ -250,6 +297,21 @@ import {
   GetMergeRequestNoteSchema,
   DeleteMergeRequestDiscussionNoteSchema,
   ResolveMergeRequestThreadSchema,
+  GetWorkItemSchema,
+  ListWorkItemsSchema,
+  CreateWorkItemSchema,
+  UpdateWorkItemSchema,
+  ConvertWorkItemTypeSchema,
+  ListWorkItemStatusesSchema,
+  ListWorkItemNotesSchema,
+  CreateWorkItemNoteSchema,
+  MoveWorkItemSchema,
+  ListCustomFieldDefinitionsSchema,
+  GetTimelineEventsSchema,
+  CreateTimelineEventSchema,
+  ListWebhooksSchema,
+  ListWebhookEventsSchema,
+  GetWebhookEventSchema,
 } from "./schemas.js";
 
 import { randomUUID } from "node:crypto";
@@ -292,17 +354,275 @@ try {
   // Intentionally ignored: version read failure is non-critical
 }
 
-const server = new Server(
-  {
-    name: "better-gitlab-mcp-server",
-    version: SERVER_VERSION,
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
+/**
+ * Create a new MCP Server instance with request handlers registered.
+ * Each transport connection gets its own Server instance to prevent
+ * cross-client data leakage (GHSA-345p-7cg4-v4c7).
+ */
+function createServer(): McpServer {
+  // Precompute filtered tool list once at server creation (Steps 1–5 are static)
+  // Step 1: Toolset filter — keep tools in enabled toolsets
+  const toolsAfterToolsets = allTools.filter(tool =>
+    isToolInEnabledToolset(tool.name, enabledToolsets)
+  );
+
+  // Step 2: Add GITLAB_TOOLS (individual tools bypass toolset filter)
+  const toolsetToolNames = new Set(toolsAfterToolsets.map(t => t.name));
+  const toolsAfterIndividual = [
+    ...toolsAfterToolsets,
+    ...allTools.filter(
+      tool => individuallyEnabledTools.has(tool.name) && !toolsetToolNames.has(tool.name)
+    ),
+  ];
+
+  // Step 3: Add legacy flag overrides (USE_PIPELINE, USE_MILESTONE, USE_GITLAB_WIKI)
+  const afterIndividualNames = new Set(toolsAfterIndividual.map(t => t.name));
+  const toolsAfterLegacy = [
+    ...toolsAfterIndividual,
+    ...allTools.filter(
+      tool => featureFlagOverrides.has(tool.name) && !afterIndividualNames.has(tool.name)
+    ),
+  ];
+
+  // Step 4: Read-only filter
+  const toolsAfterReadOnly = GITLAB_READ_ONLY_MODE
+    ? toolsAfterLegacy.filter(tool => readOnlyTools.has(tool.name))
+    : toolsAfterLegacy;
+
+  // Step 5: Regex denial filter
+  let filteredTools = GITLAB_DENIED_TOOLS_REGEX
+    ? toolsAfterReadOnly.filter(tool => !GITLAB_DENIED_TOOLS_REGEX!.test(tool.name))
+    : [...toolsAfterReadOnly];
+
+  // Step 5.5: Always include discover_tools meta-tool (bypasses toolset filter)
+  const discoverTool = allTools.find(t => t.name === "discover_tools");
+  const filteredToolNames = new Set(filteredTools.map(t => t.name));
+  if (discoverTool && !filteredToolNames.has("discover_tools")) {
+    // Respect read-only and regex denial filters
+    const passesReadOnly = !GITLAB_READ_ONLY_MODE || readOnlyTools.has("discover_tools");
+    const passesRegex = !GITLAB_DENIED_TOOLS_REGEX?.test("discover_tools");
+    if (passesReadOnly && passesRegex) {
+      filteredTools.push(discoverTool);
+    }
   }
-);
+
+  // Step 5.7: Remove hidden policy tools
+  if (hiddenToolSet.size > 0) {
+    filteredTools = filteredTools.filter(tool => !hiddenToolSet.has(tool.name));
+  }
+
+  const mcpServer = new McpServer(
+    {
+      name: "better-gitlab-mcp-server",
+      version: SERVER_VERSION,
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
+    }
+  );
+
+  mcpServer.server.setRequestHandler(ListToolsRequestSchema, async () => {
+    // Step 6: Gemini $schema cleanup + annotations (only dynamic step per request)
+    // <<< START: Remove $schema for Gemini compatibility >>>
+    const tools = filteredTools.map(tool => {
+      const modified: any = { ...tool };
+
+      // Safety net: remove $schema if present (toJSONSchema strips it for zod schemas,
+      // but manually-defined schemas like discover_tools may still have it)
+      if (modified.inputSchema && typeof modified.inputSchema === "object" && modified.inputSchema !== null) {
+        if ("$schema" in modified.inputSchema) {
+          modified.inputSchema = { ...modified.inputSchema };
+          delete modified.inputSchema.$schema;
+        }
+      }
+
+      // Add MCP tool annotations
+      modified.annotations = {
+        ...(readOnlyTools.has(tool.name) ? { readOnlyHint: true } : {}),
+        ...(destructiveTools.has(tool.name) ? { destructiveHint: true } : {}),
+        ...(approveToolSet.has(tool.name) ? { confirmationHint: true } : {}),
+        openWorldHint: true,
+      };
+
+      // Inject _confirmed optional parameter for approve-policy tools
+      if (approveToolSet.has(tool.name) && modified.inputSchema?.properties) {
+        modified.inputSchema = {
+          ...modified.inputSchema,
+          properties: {
+            ...modified.inputSchema.properties,
+            _confirmed: {
+              type: "boolean",
+              description: "Set to true to confirm execution of this approval-required tool.",
+            },
+          },
+        };
+      }
+
+      return modified;
+    });
+    // <<< END: Remove $schema for Gemini compatibility >>>
+
+    return {
+      tools, // return tool list with $schema removed
+    };
+  });
+
+  mcpServer.server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
+    // Manually retrieve the session context using the session ID passed in the request.
+    // This is a robust workaround for AsyncLocalStorage context loss.
+    const sessionId = request.params.sessionId;
+    const toolName = request.params.name;
+    const start = Date.now();
+
+    const logCompletion = (result: any) => {
+      const durationMs = Date.now() - start;
+      logger.info({ tool: toolName, event: "tool_call_done", durationMs }, `tool_call_done: ${toolName} (${durationMs}ms)`);
+      return result;
+    };
+
+    const logError = (error: unknown) => {
+      const durationMs = Date.now() - start;
+      logger.error({ tool: toolName, event: "tool_call_error", durationMs, error: error instanceof Error ? error.message : String(error) }, `tool_call_error: ${toolName} (${durationMs}ms)`);
+      throw error;
+    };
+
+    try {
+      // Handle discover_tools meta-tool directly (needs access to mcpServer and filteredTools)
+      if (toolName === "discover_tools") {
+        const category = request.params.arguments?.category?.trim()?.toLowerCase();
+        const currentToolNames = new Set(filteredTools.map(t => t.name));
+
+        if (!category) {
+          // List available categories with activation status
+          const categories = TOOLSET_DEFINITIONS.map(def => ({
+            id: def.id,
+            toolCount: def.tools.size,
+            active: [...def.tools].some(t => currentToolNames.has(t)),
+            isDefault: def.isDefault,
+          }));
+          return logCompletion({
+            content: [{
+              type: "text",
+              text: JSON.stringify({ categories, hint: "Call discover_tools with a category name to activate it" }, null, 2),
+            }],
+          });
+        }
+
+        if (!ALL_TOOLSET_IDS.has(category as ToolsetId)) {
+          return logCompletion({
+            content: [{
+              type: "text",
+              text: `Unknown category "${category}". Available: ${[...ALL_TOOLSET_IDS].join(", ")}`,
+            }],
+            isError: true,
+          });
+        }
+
+        const toolsetDef = TOOLSET_DEFINITIONS.find(d => d.id === category);
+        if (!toolsetDef) {
+          return logCompletion({
+            content: [{ type: "text", text: `Category "${category}" not found.` }],
+            isError: true,
+          });
+        }
+
+        // Check if already fully active
+        const alreadyActive = [...toolsetDef.tools].every(t => currentToolNames.has(t));
+        if (alreadyActive) {
+          return logCompletion({
+            content: [{
+              type: "text",
+              text: `Category "${category}" is already active (${toolsetDef.tools.size} tools).`,
+            }],
+          });
+        }
+
+        // Add tools from this toolset, respecting all filtering policies
+        const newTools: typeof allTools = [];
+        for (const tool of allTools) {
+          if (!toolsetDef.tools.has(tool.name)) continue;
+          if (currentToolNames.has(tool.name)) continue;
+          if (GITLAB_READ_ONLY_MODE && !readOnlyTools.has(tool.name)) continue;
+          if (GITLAB_DENIED_TOOLS_REGEX?.test(tool.name)) continue;
+          if (hiddenToolSet.has(tool.name)) continue;
+          newTools.push(tool);
+        }
+
+        if (newTools.length === 0) {
+          return logCompletion({
+            content: [{
+              type: "text",
+              text: `Category "${category}" has no additional tools to activate (all already active or filtered).`,
+            }],
+          });
+        }
+
+        filteredTools.push(...newTools);
+
+        // Notify client that tool list has changed
+        try {
+          await mcpServer.server.sendToolListChanged();
+        } catch {
+          // Client may not support notifications - safe to ignore
+        }
+
+        const addedNames = newTools.map(t => t.name);
+        logger.info({ event: "toolset_activated", category, toolCount: addedNames.length }, `Activated toolset: ${category} (+${addedNames.length} tools)`);
+
+        return logCompletion({
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              activated: category,
+              addedTools: addedNames,
+              totalTools: filteredTools.length,
+            }, null, 2),
+          }],
+        });
+      }
+
+      // Check approve policy: tool is exposed but requires explicit confirmation
+      if (approveToolSet.has(toolName)) {
+        const confirmed = request.params.arguments?._confirmed === true;
+        if (!confirmed) {
+          logger.info({ tool: toolName, event: "tool_call_approval_required" }, `Approval required: ${toolName}`);
+          return logCompletion({
+            content: [{
+              type: "text",
+              text: `Tool "${toolName}" requires confirmation. This tool is marked as requiring approval before execution. Re-call with _confirmed: true to proceed.`,
+            }],
+          });
+        }
+        // Strip _confirmed from args before forwarding to handler
+        const { _confirmed, ...cleanArgs } = request.params.arguments || {};
+        request.params.arguments = cleanArgs;
+      }
+
+      if ((REMOTE_AUTHORIZATION || GITLAB_MCP_OAUTH) && sessionId && authBySession[sessionId]) {
+        const authData = authBySession[sessionId];
+        const sessionContext: SessionAuth = {
+          sessionId,
+          header: authData.header,
+          token: authData.token,
+          lastUsed: authData.lastUsed,
+          apiUrl: authData.apiUrl,
+        };
+        // Run the handler within the retrieved context
+        const result = await sessionAuthStore.run(sessionContext, () => handleToolCall(request.params));
+        return logCompletion(result);
+      }
+      // Fallback for non-remote-auth mode or if session is not found
+      const result = await handleToolCall(request.params);
+      return logCompletion(result);
+    } catch (error) {
+      logError(error);
+    }
+  });
+
+  return mcpServer;
+}
 
 /**
  * Validate configuration at startup
@@ -346,7 +666,7 @@ function validateConfiguration(): void {
   }
 
   // Validate PORT
-  const portStr = getConfig('port', 'PORT');
+  const portStr = getConfig("port", "PORT");
   if (portStr) {
     const port = Number.parseInt(portStr, 10);
     if (Number.isNaN(port) || port < 1 || port > 65535) {
@@ -355,7 +675,7 @@ function validateConfiguration(): void {
   }
 
   // Validate GITLAB_API_URL format
-  const apiUrls = getConfig('api-url', 'GITLAB_API_URL')?.split(",") || [];
+  const apiUrls = getConfig("api-url", "GITLAB_API_URL")?.split(",") || [];
   if (apiUrls.length > 0) {
     for (const url of apiUrls) {
       try {
@@ -367,16 +687,57 @@ function validateConfiguration(): void {
   }
 
   // Validate auth configuration
-  const remoteAuth = getConfig('remote-auth', 'REMOTE_AUTHORIZATION') === "true";
-  const useOAuth = getConfig('use-oauth', 'GITLAB_USE_OAUTH') === "true";
-  const hasToken = !!getConfig('token', 'GITLAB_PERSONAL_ACCESS_TOKEN');
-  const hasCookie = !!getConfig('cookie-path', 'GITLAB_AUTH_COOKIE_PATH');
+  const remoteAuth = getConfig("remote-auth", "REMOTE_AUTHORIZATION") === "true";
+  const useOAuth = getConfig("use-oauth", "GITLAB_USE_OAUTH") === "true";
+  const hasToken = !!getConfig("token", "GITLAB_PERSONAL_ACCESS_TOKEN");
+  const hasJobToken = !!getConfig("job-token", "GITLAB_JOB_TOKEN");
+  const hasCookie = !!getConfig("cookie-path", "GITLAB_AUTH_COOKIE_PATH");
+  const mcpOAuth = getConfig("mcp-oauth", "GITLAB_MCP_OAUTH") === "true";
+  const mcpServerUrl = getConfig("mcp-server-url", "MCP_SERVER_URL");
 
-  if (!remoteAuth && !useOAuth && !hasToken && !hasCookie) {
-    errors.push('Either --token, --cookie-path, --use-oauth=true, or --remote-auth=true must be set (or use environment variables)');
+  if (!remoteAuth && !useOAuth && !hasToken && !hasJobToken && !hasCookie && !mcpOAuth) {
+    errors.push(
+      "Either --token, --job-token, --cookie-path, --use-oauth=true, --remote-auth=true, or --mcp-oauth=true must be set (or use environment variables)"
+    );
   }
 
-  const enableDynamicApiUrl = getConfig('enable-dynamic-api-url', 'ENABLE_DYNAMIC_API_URL') === "true";
+  if (mcpOAuth) {
+    if (!mcpServerUrl) {
+      errors.push(
+        "MCP_SERVER_URL is required when GITLAB_MCP_OAUTH=true (e.g. https://mcp.example.com)"
+      );
+    } else {
+      try {
+        const u = new URL(mcpServerUrl);
+        const isInsecure = u.protocol !== "https:";
+        const isLocalhost = u.hostname === "localhost" || u.hostname === "127.0.0.1";
+        const allowInsecure =
+          process.env.MCP_DANGEROUSLY_ALLOW_INSECURE_ISSUER_URL === "true";
+        if (isInsecure && !isLocalhost && !allowInsecure) {
+          errors.push(
+            "MCP_SERVER_URL must use HTTPS in production " +
+              "(set MCP_DANGEROUSLY_ALLOW_INSECURE_ISSUER_URL=true for local dev)"
+          );
+        }
+      } catch {
+        errors.push(`MCP_SERVER_URL is not a valid URL: ${mcpServerUrl}`);
+      }
+    }
+
+    if (!getConfig("api-url", "GITLAB_API_URL")) {
+      errors.push("GITLAB_API_URL is required when GITLAB_MCP_OAUTH=true");
+    }
+
+    if (!getConfig("oauth-app-id", "GITLAB_OAUTH_APP_ID")) {
+      errors.push(
+        "GITLAB_OAUTH_APP_ID is required when GITLAB_MCP_OAUTH=true " +
+          "(create an OAuth application in GitLab Admin with the required scopes)"
+      );
+    }
+  }
+
+  const enableDynamicApiUrl =
+    getConfig("enable-dynamic-api-url", "ENABLE_DYNAMIC_API_URL") === "true";
   if (enableDynamicApiUrl && !remoteAuth) {
     errors.push("ENABLE_DYNAMIC_API_URL=true requires REMOTE_AUTHORIZATION=true");
   }
@@ -390,70 +751,102 @@ function validateConfiguration(): void {
   logger.info("Configuration validation passed");
 }
 
-const GITLAB_PERSONAL_ACCESS_TOKEN = getConfig('token', 'GITLAB_PERSONAL_ACCESS_TOKEN');
 let OAUTH_ACCESS_TOKEN: string | null = null;
-const GITLAB_AUTH_COOKIE_PATH = getConfig('cookie-path', 'GITLAB_AUTH_COOKIE_PATH');
-const USE_OAUTH = getConfig('use-oauth', 'GITLAB_USE_OAUTH') === "true";
-const IS_OLD = getConfig('is-old', 'GITLAB_IS_OLD') === "true";
-const GITLAB_READ_ONLY_MODE = getConfig('read-only', 'GITLAB_READ_ONLY_MODE') === "true";
-const GITLAB_DENIED_TOOLS_REGEX = getConfig('denied-tools-regex', 'GITLAB_DENIED_TOOLS_REGEX')
-  ? new RegExp(getConfig('denied-tools-regex', 'GITLAB_DENIED_TOOLS_REGEX')!)
-  : undefined;
-const USE_GITLAB_WIKI = getConfig('use-wiki', 'USE_GITLAB_WIKI') === "true";
-const USE_MILESTONE = getConfig('use-milestone', 'USE_MILESTONE') === "true";
-const USE_PIPELINE = getConfig('use-pipeline', 'USE_PIPELINE') === "true";
-const SSE = getConfig('sse', 'SSE') === "true";
-const STREAMABLE_HTTP = getConfig('streamable-http', 'STREAMABLE_HTTP') === "true";
-const REMOTE_AUTHORIZATION = getConfig('remote-auth', 'REMOTE_AUTHORIZATION') === "true";
-const ENABLE_DYNAMIC_API_URL = getConfig('enable-dynamic-api-url', 'ENABLE_DYNAMIC_API_URL') === "true";
-const SESSION_TIMEOUT_SECONDS = Number.parseInt(getConfig('session-timeout', 'SESSION_TIMEOUT_SECONDS', '3600'), 10);
-const HOST = getConfig('host', 'HOST') || '127.0.0.1';
-const PORT = Number.parseInt(getConfig('port', 'PORT', '3002'), 10);
-// Add proxy configuration
-const HTTP_PROXY = getConfig('http-proxy', 'HTTP_PROXY');
-const HTTPS_PROXY = getConfig('https-proxy', 'HTTPS_PROXY');
-const NODE_TLS_REJECT_UNAUTHORIZED = getConfig('tls-reject-unauthorized', 'NODE_TLS_REJECT_UNAUTHORIZED');
-const GITLAB_CA_CERT_PATH = getConfig('ca-cert-path', 'GITLAB_CA_CERT_PATH');
-const GITLAB_POOL_MAX_SIZE = getConfig('pool-max-size', 'GITLAB_POOL_MAX_SIZE')
-  ? Number.parseInt(getConfig('pool-max-size', 'GITLAB_POOL_MAX_SIZE')!, 10)
-  : 100;
+let oauthClient: GitLabOAuth | null = null;
+/**
+ * Ensure the OAuth token is valid before making an API call.
+ * Refreshes the token lazily (only when a tool is actually called).
+ * This avoids background timers that cause issues with multiple instances.
+ */
+async function ensureValidOAuthToken(): Promise<void> {
+  if (!oauthClient) return;
 
-let sslOptions = undefined;
-if (NODE_TLS_REJECT_UNAUTHORIZED === "0") {
-  sslOptions = { rejectUnauthorized: false };
-} else if (GITLAB_CA_CERT_PATH) {
-  const ca = fs.readFileSync(GITLAB_CA_CERT_PATH);
-  sslOptions = { ca };
-}
+  if (oauthClient.hasValidToken()) return;
 
-// Configure proxy agents if proxies are set
-let httpAgent: Agent | undefined = undefined;
-let httpsAgent: Agent | undefined = undefined;
-
-if (HTTP_PROXY) {
-  if (HTTP_PROXY.startsWith("socks")) {
-    httpAgent = new SocksProxyAgent(HTTP_PROXY);
-  } else {
-    httpAgent = new HttpProxyAgent(HTTP_PROXY);
+  try {
+    logger.info("OAuth token expired or missing, refreshing...");
+    const freshToken = await oauthClient.getAccessToken();
+    OAUTH_ACCESS_TOKEN = freshToken;
+    logger.info("OAuth token refreshed successfully");
+  } catch (error) {
+    logger.error("Failed to refresh OAuth token:", error);
+    throw error;
   }
 }
-if (HTTPS_PROXY) {
-  if (HTTPS_PROXY.startsWith("socks")) {
-    httpsAgent = new SocksProxyAgent(HTTPS_PROXY);
-  } else {
-    httpsAgent = new HttpsProxyAgent(HTTPS_PROXY, sslOptions);
+
+const GITLAB_DENIED_TOOLS_REGEX = (() => {
+  const pattern = getConfig("denied-tools-regex", "GITLAB_DENIED_TOOLS_REGEX");
+  if (!pattern) return undefined;
+
+  // Reject patterns that are too long (potential ReDoS vector)
+  const MAX_PATTERN_LENGTH = 200;
+  if (pattern.length > MAX_PATTERN_LENGTH) {
+    logger.error(
+      `GITLAB_DENIED_TOOLS_REGEX pattern exceeds ${MAX_PATTERN_LENGTH} chars. Ignoring.`
+    );
+    return undefined;
+  }
+
+  // Reject patterns with nested quantifiers that can cause catastrophic backtracking (ReDoS)
+  // e.g., (a+)+, (a*)+, (a+)*, (a{1,})+
+  // Note: lookahead (?!), (?=), lookbehind (?<), and named groups (?<name>) are safe and allowed
+  const NESTED_QUANTIFIER_PATTERN = /(\(.*[+*?].*\)|\[.*\])[+*?]/;
+  if (NESTED_QUANTIFIER_PATTERN.test(pattern)) {
+    logger.error(
+      `GITLAB_DENIED_TOOLS_REGEX contains potentially unsafe nested quantifiers. Ignoring.`
+    );
+    return undefined;
+  }
+
+  try {
+    const regex = new RegExp(pattern);
+    // Dry-run against a sample string to catch immediate issues
+    regex.test("sample_tool_name");
+    return regex;
+  } catch {
+    logger.error(`Invalid GITLAB_DENIED_TOOLS_REGEX pattern: "${pattern}". Ignoring.`);
+    return undefined;
+  }
+})();
+
+// ---------------------------------------------------------------------------
+// Tool policy: approve / hidden sets
+// ---------------------------------------------------------------------------
+const approveToolSet = new Set(
+  (GITLAB_TOOL_POLICY_APPROVE_RAW || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+const hiddenToolSet = new Set(
+  (GITLAB_TOOL_POLICY_HIDDEN_RAW || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
+// Validate approve/hidden tool names against known tools at startup
+{
+  const knownToolNames = new Set(allTools.map(t => t.name));
+  for (const name of approveToolSet) {
+    if (!knownToolNames.has(name)) {
+      logger.warn({ event: "unknown_approve_tool", name }, `GITLAB_TOOL_POLICY_APPROVE contains unknown tool: "${name}"`);
+    }
+  }
+  for (const name of hiddenToolSet) {
+    if (!knownToolNames.has(name)) {
+      logger.warn({ event: "unknown_hidden_tool", name }, `GITLAB_TOOL_POLICY_HIDDEN contains unknown tool: "${name}"`);
+    }
   }
 }
-httpsAgent = httpsAgent || new HttpsAgent(sslOptions);
-httpAgent = httpAgent || new Agent();
 
-// Initialize the client pool for managing multiple GitLab instances
 const clientPool = new GitLabClientPool({
-  apiUrls: (process.env.GITLAB_API_URL || "https://gitlab.com")
+  apiUrls: (getConfig("api-url", "GITLAB_API_URL") || "https://gitlab.com")
     .split(",")
     .map(normalizeGitLabApiUrl),
   httpProxy: HTTP_PROXY,
   httpsProxy: HTTPS_PROXY,
+  noProxy: NO_PROXY,
   rejectUnauthorized: NODE_TLS_REJECT_UNAUTHORIZED !== "0",
   caCertPath: GITLAB_CA_CERT_PATH,
   poolMaxSize: GITLAB_POOL_MAX_SIZE,
@@ -514,9 +907,29 @@ const createCookieJar = async (): Promise<CookieJar | null> => {
   return jar;
 };
 
+// Auth retry helpers — extracted to auth-retry.ts for testability (no side effects)
+export {
+  headersToPlainObject,
+  isNonReplayableBody,
+  wrapWithAuthRetry,
+  type AuthRetryConfig,
+} from "./auth-retry.js";
+import { wrapWithAuthRetry } from "./auth-retry.js";
+
+/** Build AuthRetryConfig from module globals (lazy — reads globals at call time). */
+function defaultAuthRetryConfig() {
+  return {
+    isOAuthEnabled: () => USE_OAUTH && oauthClient != null,
+    refreshToken: (force: boolean) => oauthClient!.getAccessToken(force),
+    onTokenRefreshed: (token: string) => { OAUTH_ACCESS_TOKEN = token; },
+    buildAuthHeaders,
+    logger,
+  };
+}
+
 // Cookie jar and fetch - reloaded when cookie file changes
 let cookieJar: CookieJar | null = null;
-let fetch: typeof nodeFetch = nodeFetch;
+let fetch: typeof nodeFetch = wrapWithAuthRetry(nodeFetch, defaultAuthRetryConfig());
 let lastCookieMtime = 0;
 let cookieReloadLock: Promise<void> | null = null; // Mutex to prevent parallel reloads
 // Auth proxies may redirect and set cookies on the first request. We make a throwaway
@@ -540,7 +953,7 @@ async function reloadCookiesIfChanged(): Promise<void> {
         lastCookieMtime = mtime;
         const newJar = await createCookieJar();
         cookieJar = newJar;
-        fetch = newJar ? fetchCookie(nodeFetch, newJar) : nodeFetch;
+        fetch = wrapWithAuthRetry(newJar ? fetchCookie(nodeFetch, newJar) : nodeFetch, defaultAuthRetryConfig());
         initialSessionRequestMade = false;
       }
     } catch {
@@ -548,7 +961,7 @@ async function reloadCookiesIfChanged(): Promise<void> {
       if (cookieJar) {
         logger.info("Cookie file removed, clearing cached cookies");
         cookieJar = null;
-        fetch = nodeFetch;
+        fetch = wrapWithAuthRetry(nodeFetch, defaultAuthRetryConfig());
         lastCookieMtime = 0;
         initialSessionRequestMade = false;
       }
@@ -584,14 +997,14 @@ async function ensureSessionForRequest(): Promise<void> {
 // Session auth context for remote authorization
 interface SessionAuth {
   sessionId: string;
-  header: "Authorization" | "Private-Token";
+  header: "Authorization" | "Private-Token" | "JOB-TOKEN";
   token: string;
   lastUsed: number;
   apiUrl: string; // The API URL for the current request
 }
 
 interface AuthData {
-  header: "Authorization" | "Private-Token";
+  header: "Authorization" | "Private-Token" | "JOB-TOKEN";
   token: string;
   lastUsed: number;
   apiUrl: string;
@@ -611,11 +1024,11 @@ const BASE_HEADERS: Record<string, string> = {
 
 /**
  * Build authentication headers dynamically based on context
- * In REMOTE_AUTHORIZATION mode, reads from AsyncLocalStorage session context
- * Otherwise, uses environment token
+ * In REMOTE_AUTHORIZATION or GITLAB_MCP_OAUTH mode, reads from AsyncLocalStorage session context
+ * Otherwise, uses environment token (OAuth token is refreshed lazily before each tool call)
  */
 function buildAuthHeaders(): Record<string, string> {
-  if (REMOTE_AUTHORIZATION) {
+  if (REMOTE_AUTHORIZATION || GITLAB_MCP_OAUTH) {
     const ctx = sessionAuthStore.getStore();
     logger.debug({ context: ctx }, "buildAuthHeaders: session context");
     if (ctx?.token) {
@@ -626,7 +1039,10 @@ function buildAuthHeaders(): Record<string, string> {
     return {}; // No auth headers if no session context
   }
 
-  // Standard mode: prioritize OAuth token, then fall back to environment token
+  // Standard mode: PAT preferred over job token (broader permissions).
+  // OAuth token takes priority over PAT when both are set.
+  // NOTE: Changed in PR #400 — previously GITLAB_JOB_TOKEN had highest priority.
+  // If both GITLAB_PERSONAL_ACCESS_TOKEN and GITLAB_JOB_TOKEN are set, PAT wins.
   const token = OAUTH_ACCESS_TOKEN || GITLAB_PERSONAL_ACCESS_TOKEN;
 
   if (IS_OLD && token) {
@@ -635,6 +1051,12 @@ function buildAuthHeaders(): Record<string, string> {
   if (token) {
     return { Authorization: `Bearer ${token}` };
   }
+
+  // Fall back to CI job token
+  if (GITLAB_JOB_TOKEN) {
+    return { "JOB-TOKEN": String(GITLAB_JOB_TOKEN) };
+  }
+
   return {};
 }
 
@@ -667,7 +1089,7 @@ function getEffectiveApiUrl(): string {
  */
 const getFetchConfig = () => {
   const effectiveApiUrl = getEffectiveApiUrl();
-  const agent = clientPool.getOrCreateAgentForUrl(effectiveApiUrl);
+  const agent = clientPool.getAgentFunctionForUrl(effectiveApiUrl);
 
   return {
     headers: { ...BASE_HEADERS, ...buildAuthHeaders() },
@@ -675,722 +1097,89 @@ const getFetchConfig = () => {
   };
 };
 
-const toJSONSchema = (schema: z.ZodTypeAny) => {
-  const jsonSchema = zodToJsonSchema(schema, { $refStrategy: 'none' });
-  
-  // Post-process to fix nullable/optional fields that should truly be optional
-  function fixNullableOptional(obj: any): any {
-    if (obj && typeof obj === 'object') {
-      // If this object has properties, process them
-      if (obj.properties) {
-        const requiredSet = new Set<string>(obj.required || []);
-        Object.keys(obj.properties).forEach(key => {
-          const prop = obj.properties[key];
-          
-          // Handle fields that can be null or omitted
-          // If a property has type: ["object", "null"] or anyOf with null, it should not be required
-          if (prop.anyOf && prop.anyOf.some((t: any) => t.type === 'null')) {
-            requiredSet.delete(key);
-          } else if (Array.isArray(prop.type) && prop.type.includes('null')) {
-            requiredSet.delete(key);
-          }
-          
-          // Recursively process nested objects
-          obj.properties[key] = fixNullableOptional(prop);
-        });
-        // Normalize the required array after processing all properties
-        if (requiredSet.size > 0) {
-          obj.required = Array.from(requiredSet);
-        } else if (Object.prototype.hasOwnProperty.call(obj, 'required')) {
-          delete obj.required;
-        }
-      }
-      
-      // Process anyOf/allOf/oneOf
-      ['anyOf', 'allOf', 'oneOf'].forEach(combiner => {
-        if (obj[combiner]) {
-          obj[combiner] = obj[combiner].map(fixNullableOptional);
-        }
-      });
-    }
-    
-    return obj;
-  }
-  
-  return fixNullableOptional(jsonSchema);
-};
 
-// Define all available tools
-const allTools = [
-  {
-    name: "merge_merge_request",
-    description: "Merge a merge request in a GitLab project",
-    inputSchema: toJSONSchema(MergeMergeRequestSchema),
-  },
-  {
-    name: "approve_merge_request",
-    description: "Approve a merge request. Requires appropriate permissions.",
-    inputSchema: toJSONSchema(ApproveMergeRequestSchema),
-  },
-  {
-    name: "unapprove_merge_request",
-    description: "Unapprove a previously approved merge request. Requires appropriate permissions.",
-    inputSchema: toJSONSchema(UnapproveMergeRequestSchema),
-  },
-  {
-    name: "get_merge_request_approval_state",
-    description:
-      "Get the approval state of a merge request including approval rules and who has approved",
-    inputSchema: toJSONSchema(GetMergeRequestApprovalStateSchema),
-  },
-  {
-    name: "execute_graphql",
-    description: "Execute a GitLab GraphQL query",
-    inputSchema: zodToJsonSchema(ExecuteGraphQLSchema),
-  },
-  {
-    name: "create_or_update_file",
-    description: "Create or update a single file in a GitLab project",
-    inputSchema: toJSONSchema(CreateOrUpdateFileSchema),
-  },
-  {
-    name: "search_repositories",
-    description: "Search for GitLab projects",
-    inputSchema: toJSONSchema(SearchRepositoriesSchema),
-  },
-  {
-    name: "create_repository",
-    description: "Create a new GitLab project",
-    inputSchema: toJSONSchema(CreateRepositorySchema),
-  },
-  {
-    name: "get_file_contents",
-    description: "Get the contents of a file or directory from a GitLab project",
-    inputSchema: toJSONSchema(GetFileContentsSchema),
-  },
-  {
-    name: "push_files",
-    description: "Push multiple files to a GitLab project in a single commit",
-    inputSchema: toJSONSchema(PushFilesSchema),
-  },
-  {
-    name: "create_issue",
-    description: "Create a new issue in a GitLab project",
-    inputSchema: toJSONSchema(CreateIssueSchema),
-  },
-  {
-    name: "create_merge_request",
-    description: "Create a new merge request in a GitLab project",
-    inputSchema: toJSONSchema(CreateMergeRequestSchema),
-  },
-  {
-    name: "fork_repository",
-    description: "Fork a GitLab project to your account or specified namespace",
-    inputSchema: toJSONSchema(ForkRepositorySchema),
-  },
-  {
-    name: "create_branch",
-    description: "Create a new branch in a GitLab project",
-    inputSchema: toJSONSchema(CreateBranchSchema),
-  },
-  {
-    name: "get_merge_request",
-    description:
-      "Get details of a merge request (Either mergeRequestIid or branchName must be provided)",
-    inputSchema: toJSONSchema(GetMergeRequestSchema),
-  },
-  {
-    name: "get_merge_request_diffs",
-    description:
-      "Get the changes/diffs of a merge request (Either mergeRequestIid or branchName must be provided)",
-    inputSchema: toJSONSchema(GetMergeRequestDiffsSchema),
-  },
-  {
-    name: "list_merge_request_diffs",
-    description:
-      "List merge request diffs with pagination support (Either mergeRequestIid or branchName must be provided)",
-    inputSchema: toJSONSchema(ListMergeRequestDiffsSchema),
-  },
-  {
-    name: "list_merge_request_versions",
-    description: "List all versions of a merge request",
-    inputSchema: toJSONSchema(ListMergeRequestVersionsSchema),
-  },
-  {
-    name: "get_merge_request_version",
-    description: "Get a specific version of a merge request",
-    inputSchema: toJSONSchema(GetMergeRequestVersionSchema),
-  },
-  {
-    name: "get_branch_diffs",
-    description: "Get the changes/diffs between two branches or commits in a GitLab project",
-    inputSchema: toJSONSchema(GetBranchDiffsSchema),
-  },
-  {
-    name: "update_merge_request",
-    description: "Update a merge request (Either mergeRequestIid or branchName must be provided)",
-    inputSchema: toJSONSchema(UpdateMergeRequestSchema),
-  },
-  {
-    name: "create_note",
-    description: "Create a new note (comment) to an issue or merge request",
-    inputSchema: toJSONSchema(CreateNoteSchema),
-  },
-  {
-    name: "create_merge_request_thread",
-    description: "Create a new thread on a merge request",
-    inputSchema: toJSONSchema(CreateMergeRequestThreadSchema),
-  },
-  {
-    name: "resolve_merge_request_thread",
-    description: "Resolve a thread on a merge request",
-    inputSchema: toJSONSchema(ResolveMergeRequestThreadSchema),
-  },
-  {
-    name: "mr_discussions",
-    description: "List discussion items for a merge request",
-    inputSchema: toJSONSchema(ListMergeRequestDiscussionsSchema),
-  },
-  {
-    name: "delete_merge_request_discussion_note",
-    description: "Delete a discussion note on a merge request",
-    inputSchema: toJSONSchema(DeleteMergeRequestDiscussionNoteSchema),
-  },
-  {
-    name: "update_merge_request_discussion_note",
-    description: "Update a discussion note on a merge request",
-    inputSchema: toJSONSchema(UpdateMergeRequestDiscussionNoteSchema),
-  },
-  {
-    name: "create_merge_request_discussion_note",
-    description: "Add a new discussion note to an existing merge request thread",
-    inputSchema: toJSONSchema(CreateMergeRequestDiscussionNoteSchema),
-  },
-  {
-    name: "create_merge_request_note",
-    description: "Add a new note to a merge request",
-    inputSchema: toJSONSchema(CreateMergeRequestNoteSchema),
-  },
-  {
-    name: "delete_merge_request_note",
-    description: "Delete an existing merge request note",
-    inputSchema: toJSONSchema(DeleteMergeRequestNoteSchema),
-  },
-  {
-    name: "get_merge_request_note",
-    description: "Get a specific note for a merge request",
-    inputSchema: toJSONSchema(GetMergeRequestNoteSchema),
-  },
-  {
-    name: "get_merge_request_notes",
-    description: "List notes for a merge request",
-    inputSchema: toJSONSchema(GetMergeRequestNotesSchema),
-  },
-  {
-    name: "update_merge_request_note",
-    description: "Modify an existing merge request note",
-    inputSchema: toJSONSchema(UpdateMergeRequestNoteSchema),
-  },
-  {
-    name: "get_draft_note",
-    description: "Get a single draft note from a merge request",
-    inputSchema: toJSONSchema(GetDraftNoteSchema),
-  },
-  {
-    name: "list_draft_notes",
-    description: "List draft notes for a merge request",
-    inputSchema: toJSONSchema(ListDraftNotesSchema),
-  },
-  {
-    name: "create_draft_note",
-    description: "Create a draft note for a merge request",
-    inputSchema: toJSONSchema(CreateDraftNoteSchema),
-  },
-  {
-    name: "update_draft_note",
-    description: "Update an existing draft note",
-    inputSchema: toJSONSchema(UpdateDraftNoteSchema),
-  },
-  {
-    name: "delete_draft_note",
-    description: "Delete a draft note",
-    inputSchema: toJSONSchema(DeleteDraftNoteSchema),
-  },
-  {
-    name: "publish_draft_note",
-    description: "Publish a single draft note",
-    inputSchema: toJSONSchema(PublishDraftNoteSchema),
-  },
-  {
-    name: "bulk_publish_draft_notes",
-    description: "Publish all draft notes for a merge request",
-    inputSchema: toJSONSchema(BulkPublishDraftNotesSchema),
-  },
-  {
-    name: "update_issue_note",
-    description: "Modify an existing issue thread note",
-    inputSchema: toJSONSchema(UpdateIssueNoteSchema),
-  },
-  {
-    name: "create_issue_note",
-    description: "Add a new note to an existing issue thread",
-    inputSchema: toJSONSchema(CreateIssueNoteSchema),
-  },
-  {
-    name: "list_issues",
-    description:
-      "List issues (default: created by current user only; use scope='all' for all accessible issues)",
-    inputSchema: toJSONSchema(ListIssuesSchema),
-  },
-  {
-    name: "my_issues",
-    description: "List issues assigned to the authenticated user (defaults to open issues)",
-    inputSchema: toJSONSchema(MyIssuesSchema),
-  },
-  {
-    name: "get_issue",
-    description: "Get details of a specific issue in a GitLab project",
-    inputSchema: toJSONSchema(GetIssueSchema),
-  },
-  {
-    name: "update_issue",
-    description: "Update an issue in a GitLab project",
-    inputSchema: toJSONSchema(UpdateIssueSchema),
-  },
-  {
-    name: "delete_issue",
-    description: "Delete an issue from a GitLab project",
-    inputSchema: toJSONSchema(DeleteIssueSchema),
-  },
-  {
-    name: "list_issue_links",
-    description: "List all issue links for a specific issue",
-    inputSchema: toJSONSchema(ListIssueLinksSchema),
-  },
-  {
-    name: "list_issue_discussions",
-    description: "List discussions for an issue in a GitLab project",
-    inputSchema: toJSONSchema(ListIssueDiscussionsSchema),
-  },
-  {
-    name: "get_issue_link",
-    description: "Get a specific issue link",
-    inputSchema: toJSONSchema(GetIssueLinkSchema),
-  },
-  {
-    name: "create_issue_link",
-    description: "Create an issue link between two issues",
-    inputSchema: toJSONSchema(CreateIssueLinkSchema),
-  },
-  {
-    name: "delete_issue_link",
-    description: "Delete an issue link",
-    inputSchema: toJSONSchema(DeleteIssueLinkSchema),
-  },
-  {
-    name: "list_namespaces",
-    description: "List all namespaces available to the current user",
-    inputSchema: toJSONSchema(ListNamespacesSchema),
-  },
-  {
-    name: "get_namespace",
-    description: "Get details of a namespace by ID or path",
-    inputSchema: toJSONSchema(GetNamespaceSchema),
-  },
-  {
-    name: "verify_namespace",
-    description: "Verify if a namespace path exists",
-    inputSchema: toJSONSchema(VerifyNamespaceSchema),
-  },
-  {
-    name: "get_project",
-    description: "Get details of a specific project",
-    inputSchema: toJSONSchema(GetProjectSchema),
-  },
-  {
-    name: "list_projects",
-    description: "List projects accessible by the current user",
-    inputSchema: toJSONSchema(ListProjectsSchema),
-  },
-  {
-    name: "list_project_members",
-    description: "List members of a GitLab project",
-    inputSchema: toJSONSchema(ListProjectMembersSchema),
-  },
-  {
-    name: "list_labels",
-    description: "List labels for a project",
-    inputSchema: toJSONSchema(ListLabelsSchema),
-  },
-  {
-    name: "get_label",
-    description: "Get a single label from a project",
-    inputSchema: toJSONSchema(GetLabelSchema),
-  },
-  {
-    name: "create_label",
-    description: "Create a new label in a project",
-    inputSchema: toJSONSchema(CreateLabelSchema),
-  },
-  {
-    name: "update_label",
-    description: "Update an existing label in a project",
-    inputSchema: toJSONSchema(UpdateLabelSchema),
-  },
-  {
-    name: "delete_label",
-    description: "Delete a label from a project",
-    inputSchema: toJSONSchema(DeleteLabelSchema),
-  },
-  {
-    name: "list_group_projects",
-    description: "List projects in a GitLab group with filtering options",
-    inputSchema: toJSONSchema(ListGroupProjectsSchema),
-  },
-  {
-    name: "list_wiki_pages",
-    description: "List wiki pages in a GitLab project",
-    inputSchema: toJSONSchema(ListWikiPagesSchema),
-  },
-  {
-    name: "get_wiki_page",
-    description: "Get details of a specific wiki page",
-    inputSchema: toJSONSchema(GetWikiPageSchema),
-  },
-  {
-    name: "create_wiki_page",
-    description: "Create a new wiki page in a GitLab project",
-    inputSchema: toJSONSchema(CreateWikiPageSchema),
-  },
-  {
-    name: "update_wiki_page",
-    description: "Update an existing wiki page in a GitLab project",
-    inputSchema: toJSONSchema(UpdateWikiPageSchema),
-  },
-  {
-    name: "delete_wiki_page",
-    description: "Delete a wiki page from a GitLab project",
-    inputSchema: toJSONSchema(DeleteWikiPageSchema),
-  },
-  {
-    name: "get_repository_tree",
-    description: "Get the repository tree for a GitLab project (list files and directories)",
-    inputSchema: toJSONSchema(GetRepositoryTreeSchema),
-  },
-  {
-    name: "list_pipelines",
-    description: "List pipelines in a GitLab project with filtering options",
-    inputSchema: toJSONSchema(ListPipelinesSchema),
-  },
-  {
-    name: "get_pipeline",
-    description: "Get details of a specific pipeline in a GitLab project",
-    inputSchema: toJSONSchema(GetPipelineSchema),
-  },
-  {
-    name: "list_pipeline_jobs",
-    description: "List all jobs in a specific pipeline",
-    inputSchema: toJSONSchema(ListPipelineJobsSchema),
-  },
-  {
-    name: "list_pipeline_trigger_jobs",
-    description:
-      "List all trigger jobs (bridges) in a specific pipeline that trigger downstream pipelines",
-    inputSchema: toJSONSchema(ListPipelineTriggerJobsSchema),
-  },
-  {
-    name: "get_pipeline_job",
-    description: "Get details of a GitLab pipeline job number",
-    inputSchema: toJSONSchema(GetPipelineJobOutputSchema),
-  },
-  {
-    name: "get_pipeline_job_output",
-    description:
-      "Get the output/trace of a GitLab pipeline job with optional pagination to limit context window usage",
-    inputSchema: toJSONSchema(GetPipelineJobOutputSchema),
-  },
-  {
-    name: "create_pipeline",
-    description: "Create a new pipeline for a branch or tag",
-    inputSchema: toJSONSchema(CreatePipelineSchema),
-  },
-  {
-    name: "retry_pipeline",
-    description: "Retry a failed or canceled pipeline",
-    inputSchema: toJSONSchema(RetryPipelineSchema),
-  },
-  {
-    name: "cancel_pipeline",
-    description: "Cancel a running pipeline",
-    inputSchema: toJSONSchema(CancelPipelineSchema),
-  },
-  {
-    name: "play_pipeline_job",
-    description: "Run a manual pipeline job",
-    inputSchema: toJSONSchema(PlayPipelineJobSchema),
-  },
-  {
-    name: "retry_pipeline_job",
-    description: "Retry a failed or canceled pipeline job",
-    inputSchema: toJSONSchema(RetryPipelineJobSchema),
-  },
-  {
-    name: "cancel_pipeline_job",
-    description: "Cancel a running pipeline job",
-    inputSchema: toJSONSchema(CancelPipelineJobSchema),
-  },
-  {
-    name: "list_merge_requests",
-    description:
-      "List merge requests. Without project_id, lists MRs assigned to the authenticated user by default (use scope='all' for all accessible MRs). With project_id, lists MRs for that specific project.",
-    inputSchema: toJSONSchema(ListMergeRequestsSchema),
-  },
-  {
-    name: "list_milestones",
-    description: "List milestones in a GitLab project with filtering options",
-    inputSchema: toJSONSchema(ListProjectMilestonesSchema),
-  },
-  {
-    name: "get_milestone",
-    description: "Get details of a specific milestone",
-    inputSchema: toJSONSchema(GetProjectMilestoneSchema),
-  },
-  {
-    name: "create_milestone",
-    description: "Create a new milestone in a GitLab project",
-    inputSchema: toJSONSchema(CreateProjectMilestoneSchema),
-  },
-  {
-    name: "edit_milestone",
-    description: "Edit an existing milestone in a GitLab project",
-    inputSchema: toJSONSchema(EditProjectMilestoneSchema),
-  },
-  {
-    name: "delete_milestone",
-    description: "Delete a milestone from a GitLab project",
-    inputSchema: toJSONSchema(DeleteProjectMilestoneSchema),
-  },
-  {
-    name: "get_milestone_issue",
-    description: "Get issues associated with a specific milestone",
-    inputSchema: toJSONSchema(GetMilestoneIssuesSchema),
-  },
-  {
-    name: "get_milestone_merge_requests",
-    description: "Get merge requests associated with a specific milestone",
-    inputSchema: toJSONSchema(GetMilestoneMergeRequestsSchema),
-  },
-  {
-    name: "promote_milestone",
-    description: "Promote a milestone to the next stage",
-    inputSchema: toJSONSchema(PromoteProjectMilestoneSchema),
-  },
-  {
-    name: "get_milestone_burndown_events",
-    description: "Get burndown events for a specific milestone",
-    inputSchema: toJSONSchema(GetMilestoneBurndownEventsSchema),
-  },
-  {
-    name: "get_users",
-    description: "Get GitLab user details by usernames",
-    inputSchema: toJSONSchema(GetUsersSchema),
-  },
-  {
-    name: "list_commits",
-    description: "List repository commits with filtering options",
-    inputSchema: toJSONSchema(ListCommitsSchema),
-  },
-  {
-    name: "get_commit",
-    description: "Get details of a specific commit",
-    inputSchema: toJSONSchema(GetCommitSchema),
-  },
-  {
-    name: "get_commit_diff",
-    description: "Get changes/diffs of a specific commit",
-    inputSchema: toJSONSchema(GetCommitDiffSchema),
-  },
-  {
-    name: "list_group_iterations",
-    description: "List group iterations with filtering options",
-    inputSchema: toJSONSchema(ListGroupIterationsSchema),
-  },
-  {
-    name: "upload_markdown",
-    description: "Upload a file to a GitLab project for use in markdown content",
-    inputSchema: toJSONSchema(MarkdownUploadSchema),
-  },
-  {
-    name: "download_attachment",
-    description: "Download an uploaded file from a GitLab project by secret and filename",
-    inputSchema: toJSONSchema(DownloadAttachmentSchema),
-  },
-  {
-    name: "list_events",
-    description:
-      "List all events for the currently authenticated user. Note: before/after parameters accept date format YYYY-MM-DD only",
-    inputSchema: toJSONSchema(ListEventsSchema),
-  },
-  {
-    name: "get_project_events",
-    description:
-      "List all visible events for a specified project. Note: before/after parameters accept date format YYYY-MM-DD only",
-    inputSchema: toJSONSchema(GetProjectEventsSchema),
-  },
-  {
-    name: "list_releases",
-    description: "List all releases for a project",
-    inputSchema: toJSONSchema(ListReleasesSchema),
-  },
-  {
-    name: "get_release",
-    description: "Get a release by tag name",
-    inputSchema: toJSONSchema(GetReleaseSchema),
-  },
-  {
-    name: "create_release",
-    description: "Create a new release in a GitLab project",
-    inputSchema: toJSONSchema(CreateReleaseSchema),
-  },
-  {
-    name: "update_release",
-    description: "Update an existing release in a GitLab project",
-    inputSchema: toJSONSchema(UpdateReleaseSchema),
-  },
-  {
-    name: "delete_release",
-    description: "Delete a release from a GitLab project (does not delete the associated tag)",
-    inputSchema: toJSONSchema(DeleteReleaseSchema),
-  },
-  {
-    name: "create_release_evidence",
-    description: "Create release evidence for an existing release (GitLab Premium/Ultimate only)",
-    inputSchema: toJSONSchema(CreateReleaseEvidenceSchema),
-  },
-  {
-    name: "download_release_asset",
-    description: "Download a release asset file by direct asset path",
-    inputSchema: toJSONSchema(DownloadReleaseAssetSchema),
-  },
-];
+// Compute at startup
+const enabledToolsets = parseEnabledToolsets(GITLAB_TOOLSETS_RAW);
+const individuallyEnabledTools = parseIndividualTools(GITLAB_TOOLS_RAW);
+const featureFlagOverrides = buildFeatureFlagOverrides();
 
-// Define which tools are read-only
-const readOnlyTools = new Set([
-  "search_repositories",
-  "execute_graphql",
-  "get_file_contents",
-  "get_merge_request",
-  "get_merge_request_diffs",
-  "list_merge_request_versions",
-  "get_merge_request_version",
-  "get_branch_diffs",
-  "mr_discussions",
-  "list_issues",
-  "my_issues",
-  "list_merge_requests",
-  "get_issue",
-  "list_issue_links",
-  "list_issue_discussions",
-  "get_issue_link",
-  "list_namespaces",
-  "get_namespace",
-  "verify_namespace",
-  "get_project",
-  "list_projects",
-  "list_project_members",
-  "get_pipeline",
-  "list_pipelines",
-  "list_pipeline_jobs",
-  "list_pipeline_trigger_jobs",
-  "get_pipeline_job",
-  "get_pipeline_job_output",
-  "list_labels",
-  "get_label",
-  "list_group_projects",
-  "get_repository_tree",
-  "list_milestones",
-  "get_milestone",
-  "get_milestone_issue",
-  "get_milestone_merge_requests",
-  "get_milestone_burndown_events",
-  "list_wiki_pages",
-  "get_wiki_page",
-  "get_users",
-  "list_commits",
-  "get_commit",
-  "get_commit_diff",
-  "list_group_iterations",
-  "get_group_iteration",
-  "download_attachment",
-  "list_events",
-  "get_project_events",
-  "list_releases",
-  "get_release",
-  "download_release_asset",
-  "get_merge_request_approval_state",
-]);
-
-// Define which tools are related to wiki and can be toggled by USE_GITLAB_WIKI
-const wikiToolNames = new Set([
-  "list_wiki_pages",
-  "get_wiki_page",
-  "create_wiki_page",
-  "update_wiki_page",
-  "delete_wiki_page",
-  "upload_wiki_attachment",
-]);
-
-// Define which tools are related to milestones and can be toggled by USE_MILESTONE
-const milestoneToolNames = new Set([
-  "list_milestones",
-  "get_milestone",
-  "create_milestone",
-  "edit_milestone",
-  "delete_milestone",
-  "get_milestone_issue",
-  "get_milestone_merge_requests",
-  "promote_milestone",
-  "get_milestone_burndown_events",
-]);
-
-// Define which tools are related to pipelines and can be toggled by USE_PIPELINE
-const pipelineToolNames = new Set([
-  "list_pipelines",
-  "get_pipeline",
-  "list_pipeline_jobs",
-  "list_pipeline_trigger_jobs",
-  "get_pipeline_job",
-  "get_pipeline_job_output",
-  "create_pipeline",
-  "retry_pipeline",
-  "cancel_pipeline",
-  "play_pipeline_job",
-  "retry_pipeline_job",
-  "cancel_pipeline_job",
-]);
-
-/**
- * Smart URL handling for GitLab API
- *
- * @param {string | undefined} url - Input GitLab API URL
- * @returns {string} Normalized GitLab API URL with /api/v4 path
- */
-function normalizeGitLabApiUrl(url: string): string {
-  if (!url) {
-    return "https://gitlab.com/api/v4";
-  }
-  let normalizedUrl = url.trim();
-  if (normalizedUrl.endsWith("/")) {
-    normalizedUrl = normalizedUrl.slice(0, -1);
-  }
-  if (!normalizedUrl.endsWith("/api/v4")) {
-    normalizedUrl = `${normalizedUrl}/api/v4`;
-  }
-  return normalizedUrl;
+// Warn about potentially confusing configuration
+if (GITLAB_TOOLSETS_RAW && (USE_PIPELINE || USE_MILESTONE || USE_GITLAB_WIKI)) {
+  logger.warn(
+    "GITLAB_TOOLSETS is set alongside legacy flags (USE_PIPELINE, USE_MILESTONE, USE_GITLAB_WIKI). " +
+    "Legacy flags add tools additively on top of the toolset selection and may produce unexpected results."
+  );
 }
 
+const MERGE_REQUEST_DEPLOYMENT_SUMMARY_LIMIT = 10;
+
+type GitLabMergeRequestDeploymentSummaryRecord = {
+  id: string;
+  status: string;
+  ref?: string;
+  sha: string;
+  created_at: string;
+  updated_at?: string;
+  finished_at?: string | null;
+  web_url?: string;
+  environment?: {
+    id?: string;
+    name: string;
+    slug?: string;
+    external_url?: string | null;
+    state?: string;
+    tier?: string;
+  };
+  deployable?: {
+    id?: string;
+    name?: string;
+    status?: string;
+    stage?: string;
+    web_url?: string;
+    pipeline?: {
+      id?: string;
+      status?: string;
+      ref?: string;
+      sha?: string;
+      web_url?: string;
+    };
+  } | null;
+};
+
+type GitLabMergeRequestWithDeploymentSummary = GitLabMergeRequest & {
+  deployment_summary: {
+    lookup_sha: string | null;
+    sort: "created_at_desc";
+    limit: number;
+    total_count: number;
+    returned_count: number;
+    records: GitLabMergeRequestDeploymentSummaryRecord[];
+    unavailable_reason?: string;
+  };
+  commit_addition_summary: {
+    target_branch: string;
+    source_commits_count: number | null;
+    merge_method: string | null;
+    merge_commit_count: number | null;
+    summary: string | null;
+    unavailable_reason?: string;
+  };
+  approval_summary: {
+    approved: boolean | null;
+    user_has_approved: boolean | null;
+    user_can_approve: boolean | null;
+    approved_by: GitLabApprovalUser[];
+    approved_by_usernames: string[];
+    rules_count: number | null;
+    source_endpoint: "approval_state" | "approvals" | null;
+    unavailable_reason?: string;
+  };
+};
+
+
+
 // Use the normalizeGitLabApiUrl function to handle various URL formats
-const GITLAB_API_URLS = (getConfig('api-url', 'GITLAB_API_URL') || "https://gitlab.com")
+const GITLAB_API_URLS = (getConfig("api-url", "GITLAB_API_URL") || "https://gitlab.com")
   .split(",")
   .map(normalizeGitLabApiUrl);
 const GITLAB_API_URL = GITLAB_API_URLS[0];
@@ -1403,6 +1192,11 @@ const GITLAB_ALLOWED_PROJECT_IDS =
 const GITLAB_COMMIT_FILES_PER_PAGE = process.env.GITLAB_COMMIT_FILES_PER_PAGE
   ? Number.parseInt(process.env.GITLAB_COMMIT_FILES_PER_PAGE, 10)
   : 20;
+
+const GITLAB_REPO_FILE_ENCODING =
+  getConfig("repo-file-encoding", "GITLAB_REPO_FILE_ENCODING", "text") === "base64"
+    ? "base64"
+    : "text";
 
 // Validate authentication configuration
 if (REMOTE_AUTHORIZATION) {
@@ -1418,7 +1212,23 @@ if (REMOTE_AUTHORIZATION) {
     process.exit(1);
   }
   logger.info("Remote authorization enabled: tokens will be read from HTTP headers");
-} else if (!USE_OAUTH && !GITLAB_PERSONAL_ACCESS_TOKEN && !GITLAB_AUTH_COOKIE_PATH) {
+}
+
+if (GITLAB_MCP_OAUTH) {
+  if (SSE) {
+    logger.error("GITLAB_MCP_OAUTH=true is not compatible with SSE transport mode");
+    logger.error("Please use STREAMABLE_HTTP=true instead");
+    process.exit(1);
+  }
+  if (!STREAMABLE_HTTP) {
+    logger.error("GITLAB_MCP_OAUTH=true requires STREAMABLE_HTTP=true");
+    logger.error("Set STREAMABLE_HTTP=true to enable MCP OAuth");
+    process.exit(1);
+  }
+  logger.info("MCP OAuth enabled: GitLab OAuth proxy active (Private-Token/JOB-TOKEN headers bypass OAuth)");
+}
+
+if (!REMOTE_AUTHORIZATION && !GITLAB_MCP_OAUTH && !USE_OAUTH && !GITLAB_PERSONAL_ACCESS_TOKEN && !GITLAB_JOB_TOKEN && !GITLAB_AUTH_COOKIE_PATH) {
   // Standard mode: token must be in environment (unless using OAuth)
   logger.error("GITLAB_PERSONAL_ACCESS_TOKEN environment variable is not set");
   logger.info("Either set GITLAB_PERSONAL_ACCESS_TOKEN or enable OAuth with GITLAB_USE_OAUTH=true");
@@ -1475,7 +1285,14 @@ function getEffectiveProjectId(projectId: string): string {
 
     return projectId || GITLAB_ALLOWED_PROJECT_IDS[0];
   }
-  return GITLAB_PROJECT_ID || projectId;
+  // Prioritize the passed projectId over GITLAB_PROJECT_ID to allow querying different projects
+  if (projectId) {
+    return projectId;
+  }
+  if (GITLAB_PROJECT_ID) {
+    return GITLAB_PROJECT_ID;
+  }
+  throw new Error("No project ID provided and GITLAB_PROJECT_ID is not set");
 }
 
 /**
@@ -1502,7 +1319,7 @@ async function forkProject(projectId: string, namespace?: string): Promise<GitLa
     method: "POST",
   });
 
-  // 이미 존재하는 프로젝트인 경우 처리
+  // Handle case where project already exists
   if (response.status === 409) {
     throw new Error("Project already exists in the target namespace");
   }
@@ -1574,17 +1391,17 @@ async function getDefaultBranchRef(projectId: string): Promise<string> {
  * @returns {Promise<GitLabContent>} The file content
  */
 async function getFileContents(
-  projectId: string,
+  projectId: string | undefined,
   filePath: string,
   ref?: string
 ): Promise<GitLabContent> {
-  projectId = decodeURIComponent(projectId); // Decode project ID
-  const effectiveProjectId = getEffectiveProjectId(projectId);
+  const decodedProjectId = projectId ? decodeURIComponent(projectId) : "";
+  const effectiveProjectId = getEffectiveProjectId(decodedProjectId);
   const encodedPath = encodeURIComponent(filePath);
 
-  // ref가 없는 경우 default branch를 가져옴
+  // Fall back to default branch if ref is not provided
   if (!ref) {
-    ref = await getDefaultBranchRef(projectId);
+    ref = await getDefaultBranchRef(decodedProjectId);
   }
 
   const url = new URL(
@@ -1597,7 +1414,7 @@ async function getFileContents(
     ...getFetchConfig(),
   });
 
-  // 파일을 찾을 수 없는 경우 처리
+  // Handle file not found
   if (response.status === 404) {
     throw new Error(`File not found: ${filePath}`);
   }
@@ -1606,7 +1423,7 @@ async function getFileContents(
   const data = await response.json();
   const parsedData = GitLabContentSchema.parse(data);
 
-  // Base64로 인코딩된 파일 내용을 UTF-8로 디코딩
+  // Decode Base64-encoded file content to UTF-8
   if (!Array.isArray(parsedData) && parsedData.content) {
     parsedData.content = Buffer.from(parsedData.content, "base64").toString("utf8");
     parsedData.encoding = "utf8";
@@ -1615,14 +1432,6 @@ async function getFileContents(
   return parsedData;
 }
 
-/**
- * Create a new issue in a GitLab project
- * 이슈 생성 (Create an issue)
- *
- * @param {string} projectId - The ID or URL-encoded path of the project
- * @param {z.infer<typeof CreateIssueOptionsSchema>} options - Issue creation options
- * @returns {Promise<GitLabIssue>} The created issue
- */
 async function createIssue(
   projectId: string,
   options: z.infer<typeof CreateIssueOptionsSchema>
@@ -1633,19 +1442,19 @@ async function createIssue(
     `${getEffectiveApiUrl()}/projects/${encodeURIComponent(effectiveProjectId)}/issues`
   );
 
+  // Build request body, converting labels array to comma-separated string
+  const body: Record<string, any> = { ...options };
+  if (body.labels && Array.isArray(body.labels)) {
+    body.labels = body.labels.join(",");
+  }
+
   const response = await fetch(url.toString(), {
     ...getFetchConfig(),
     method: "POST",
-    body: JSON.stringify({
-      title: options.title,
-      description: options.description,
-      assignee_ids: options.assignee_ids,
-      milestone_id: options.milestone_id,
-      labels: options.labels?.join(","),
-    }),
+    body: JSON.stringify(body),
   });
 
-  // 잘못된 요청 처리
+  // Handle bad request
   if (response.status === 400) {
     const errorBody = await response.text();
     throw new Error(`Invalid request: ${errorBody}`);
@@ -1825,6 +1634,1648 @@ async function deleteIssue(projectId: string, issueIid: number | string): Promis
   });
 
   await handleGitLabError(response);
+}
+
+// --- GraphQL helper ---
+
+/**
+ * Execute a GraphQL query against the GitLab instance.
+ * Reusable helper for work item operations.
+ */
+async function executeGraphQL<T = any>(
+  query: string,
+  variables: Record<string, any> = {}
+): Promise<T> {
+  const apiUrl = new URL(getEffectiveApiUrl());
+  const restPath = apiUrl.pathname || "";
+  const idx = restPath.lastIndexOf("/api/v4");
+  const prefix = idx >= 0 ? restPath.slice(0, idx) : "";
+  const graphqlUrl =
+    process.env.GITLAB_GRAPHQL_URL || `${apiUrl.origin}${prefix}/api/graphql`;
+
+  const response = await fetch(graphqlUrl, {
+    ...getFetchConfig(),
+    method: "POST",
+    headers: {
+      ...BASE_HEADERS,
+      ...buildAuthHeaders(),
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`GraphQL request failed (${response.status}): ${errorBody}`);
+  }
+
+  const json: any = await response.json();
+  if (json.errors && json.errors.length > 0) {
+    throw new Error(`GraphQL errors: ${json.errors.map((e: any) => e.message).join(", ")}`);
+  }
+  return json.data as T;
+}
+
+/**
+ * Resolve a project path and issue IID to a work item GraphQL GID.
+ */
+async function resolveWorkItemGID(
+  projectId: string,
+  issueIid: number
+): Promise<{ workItemGID: string; projectPath: string }> {
+  projectId = decodeURIComponent(projectId);
+  const effectiveProjectId = getEffectiveProjectId(projectId);
+
+  // First get the project path via REST (needed for GraphQL namespace query)
+  const projectUrl = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(effectiveProjectId)}`
+  );
+  const projectResponse = await fetch(projectUrl.toString(), {
+    ...getFetchConfig(),
+  });
+  await handleGitLabError(projectResponse);
+  const project: any = await projectResponse.json();
+  const projectPath: string = project.path_with_namespace;
+
+  // Resolve work item GID via GraphQL
+  const data = await executeGraphQL<{
+    namespace: { workItem: { id: string } | null };
+  }>(
+    `query($path: ID!, $iid: String!) {
+      namespace(fullPath: $path) {
+        workItem(iid: $iid) {
+          id
+        }
+      }
+    }`,
+    { path: projectPath, iid: String(issueIid) }
+  );
+
+  if (!data.namespace?.workItem?.id) {
+    throw new Error(`Work item #${issueIid} not found in project ${projectPath}`);
+  }
+
+  return { workItemGID: data.namespace.workItem.id, projectPath };
+}
+
+/**
+ * Resolve label names and usernames to GitLab GIDs in a single GraphQL call.
+ */
+async function resolveNamesToIds(
+  projectPath: string,
+  labelNames?: string[],
+  usernames?: string[]
+): Promise<{ labelIds: string[]; userIds: string[] }> {
+  if (!labelNames?.length && !usernames?.length) {
+    return { labelIds: [], userIds: [] };
+  }
+  const data = await executeGraphQL<{
+    project: { labels: { nodes: Array<{ id: string; title: string }> } };
+    users: { nodes: Array<{ id: string; username: string }> };
+  }>(
+    `query($path: ID!, $usernames: [String!]!) {
+      project(fullPath: $path) { labels(includeAncestorGroups: true, first: 250) { nodes { id title } } }
+      users(usernames: $usernames) { nodes { id username } }
+    }`,
+    { path: projectPath, usernames: usernames || [] }
+  );
+  const labelIds = (labelNames || []).map(name => {
+    const label = data.project.labels.nodes.find(l => l.title === name);
+    if (!label) throw new Error(`Label '${name}' not found in project`);
+    return label.id;
+  });
+  const userIds = (usernames || []).map(name => {
+    const user = data.users.nodes.find(u => u.username === name);
+    if (!user) throw new Error(`User '${name}' not found`);
+    return user.id;
+  });
+  return { labelIds, userIds };
+}
+
+// --- Work item type conversion ---
+
+/**
+ * Map user-facing type names to GitLab WorkItemType names for GraphQL queries.
+ */
+const WORK_ITEM_TYPE_NAMES: Record<string, string> = {
+  issue: "Issue",
+  task: "Task",
+  incident: "Incident",
+  test_case: "Test Case",
+  epic: "Epic",
+  key_result: "Key Result",
+  objective: "Objective",
+  requirement: "Requirement",
+  ticket: "Ticket",
+};
+
+/**
+ * Get the GraphQL GID for a work item type by querying the project's available types.
+ */
+async function resolveWorkItemTypeGID(
+  projectPath: string,
+  typeName: string
+): Promise<string> {
+  const targetName = WORK_ITEM_TYPE_NAMES[typeName];
+  if (!targetName) {
+    throw new Error(`Unknown work item type: ${typeName}`);
+  }
+
+  const data = await executeGraphQL<{
+    namespace: { workItemTypes: { nodes: Array<{ id: string; name: string }> } };
+  }>(
+    `query($path: ID!) {
+      namespace(fullPath: $path) {
+        workItemTypes {
+          nodes {
+            id
+            name
+          }
+        }
+      }
+    }`,
+    { path: projectPath }
+  );
+
+  const typeNode = data.namespace?.workItemTypes?.nodes?.find(
+    (n) => n.name === targetName
+  );
+  if (!typeNode) {
+    throw new Error(
+      `Work item type '${targetName}' not found in project ${projectPath}`
+    );
+  }
+  return typeNode.id;
+}
+
+/**
+ * Convert an issue to a different work item type using GraphQL.
+ */
+async function convertIssueType(
+  projectId: string,
+  issueIid: number,
+  newType: string
+): Promise<{ id: string; type: string }> {
+  const { workItemGID, projectPath } = await resolveWorkItemGID(projectId, issueIid);
+  const workItemTypeGID = await resolveWorkItemTypeGID(projectPath, newType);
+
+  const data = await executeGraphQL<{
+    workItemConvert: {
+      workItem: { id: string; workItemType: { name: string } } | null;
+      errors: string[];
+    };
+  }>(
+    `mutation($id: WorkItemID!, $typeId: WorkItemsTypeID!) {
+      workItemConvert(input: { id: $id, workItemTypeId: $typeId }) {
+        workItem {
+          id
+          workItemType { name }
+        }
+        errors
+      }
+    }`,
+    { id: workItemGID, typeId: workItemTypeGID }
+  );
+
+  if (data.workItemConvert.errors?.length > 0) {
+    throw new Error(`Conversion failed: ${data.workItemConvert.errors.join(", ")}`);
+  }
+
+  return {
+    id: data.workItemConvert.workItem!.id,
+    type: data.workItemConvert.workItem!.workItemType.name,
+  };
+}
+
+// --- Work item hierarchy ---
+
+/**
+ * Remove the parent from a work item.
+ */
+async function removeIssueParent(
+  projectId: string,
+  issueIid: number
+): Promise<void> {
+  const { workItemGID } = await resolveWorkItemGID(projectId, issueIid);
+
+  const data = await executeGraphQL<{
+    workItemUpdate: {
+      workItem: { id: string } | null;
+      errors: string[];
+    };
+  }>(
+    `mutation($id: WorkItemID!) {
+      workItemUpdate(input: { id: $id, hierarchyWidget: { parentId: null } }) {
+        workItem { id }
+        errors
+      }
+    }`,
+    { id: workItemGID }
+  );
+
+  if (data.workItemUpdate.errors?.length > 0) {
+    throw new Error(`Failed to remove parent: ${data.workItemUpdate.errors.join(", ")}`);
+  }
+}
+
+// --- Work item status ---
+
+/**
+ * List available statuses for a work item type in a project.
+ * Requires Premium/Ultimate with configurable statuses enabled.
+ */
+async function listIssueStatuses(
+  projectId: string,
+  workItemType: string = "issue"
+): Promise<any> {
+  projectId = decodeURIComponent(projectId);
+  const effectiveProjectId = getEffectiveProjectId(projectId);
+
+  // Get project path
+  const projectUrl = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(effectiveProjectId)}`
+  );
+  const projectResponse = await fetch(projectUrl.toString(), {
+    ...getFetchConfig(),
+  });
+  await handleGitLabError(projectResponse);
+  const project: any = await projectResponse.json();
+
+  const typeName = WORK_ITEM_TYPE_NAMES[workItemType] || "Issue";
+
+  const data = await executeGraphQL<{
+    namespace: {
+      workItemTypes: {
+        nodes: Array<{
+          id: string;
+          name: string;
+          supportedConversionTypes: Array<{ id: string; name: string }>;
+          widgetDefinitions: Array<any>;
+        }>;
+      };
+    };
+  }>(
+    `query($path: ID!, $typeName: IssueType) {
+      namespace(fullPath: $path) {
+        workItemTypes(name: $typeName) {
+          nodes {
+            id
+            name
+            supportedConversionTypes { id name }
+            widgetDefinitions {
+              __typename
+              ... on WorkItemWidgetDefinitionStatus {
+                allowedStatuses {
+                  id
+                  name
+                  iconName
+                  color
+                  position
+                }
+              }
+              ... on WorkItemWidgetDefinitionHierarchy {
+                allowedChildTypes { nodes { id name } }
+                allowedParentTypes { nodes { id name } }
+              }
+            }
+          }
+        }
+      }
+    }`,
+    { path: project.path_with_namespace, typeName: typeName.replace(/ /g, "_").toUpperCase() }
+  );
+
+  const typeNodes = data.namespace?.workItemTypes?.nodes;
+  if (!typeNodes || typeNodes.length === 0) {
+    throw new Error(`Work item type '${typeName}' not found in project`);
+  }
+
+  const typeNode = typeNodes[0];
+
+  // Extract statuses from the status widget definition
+  const statusWidget = typeNode.widgetDefinitions?.find(
+    (w: any) => w.__typename === "WorkItemWidgetDefinitionStatus"
+  );
+  const statuses = statusWidget?.allowedStatuses || [];
+
+  // Extract hierarchy info
+  const hierarchyWidget = typeNode.widgetDefinitions?.find(
+    (w: any) => w.__typename === "WorkItemWidgetDefinitionHierarchy"
+  );
+
+  const result: Record<string, any> = {
+    work_item_type: typeNode.name,
+    statuses_available: statuses.length > 0,
+    statuses,
+  };
+
+  // Add supported conversion types
+  const conversionTypes = typeNode.supportedConversionTypes || [];
+  if (conversionTypes.length > 0) {
+    result.supported_conversion_types = conversionTypes.map((t: any) => t.name);
+  }
+
+  // Add allowed child/parent types
+  const childTypes = hierarchyWidget?.allowedChildTypes?.nodes || [];
+  const parentTypes = hierarchyWidget?.allowedParentTypes?.nodes || [];
+  if (childTypes.length > 0) {
+    result.allowed_child_types = childTypes.map((t: any) => t.name);
+  }
+  if (parentTypes.length > 0) {
+    result.allowed_parent_types = parentTypes.map((t: any) => t.name);
+  }
+
+  return result;
+}
+
+/**
+ * List available custom field definitions for a work item type.
+ */
+async function listCustomFieldDefinitions(
+  projectId: string,
+  workItemType: string = "issue"
+): Promise<any> {
+  const projectPath = await resolveProjectPath(projectId);
+  const typeName = WORK_ITEM_TYPE_NAMES[workItemType] || "Issue";
+
+  const data = await executeGraphQL<{
+    namespace: {
+      workItemTypes: {
+        nodes: Array<{
+          id: string;
+          name: string;
+          widgetDefinitions: Array<any>;
+        }>;
+      };
+    };
+  }>(
+    `query($path: ID!, $typeName: IssueType) {
+      namespace(fullPath: $path) {
+        workItemTypes(name: $typeName) {
+          nodes {
+            id
+            name
+            widgetDefinitions {
+              __typename
+              ... on WorkItemWidgetDefinitionCustomFields {
+                customFieldValues {
+                  customField {
+                    id
+                    name
+                    fieldType
+                    selectOptions { id value }
+                    workItemTypes { id name }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }`,
+    { path: projectPath, typeName: typeName.replace(/ /g, "_").toUpperCase() }
+  );
+
+  const typeNodes = data.namespace?.workItemTypes?.nodes;
+  if (!typeNodes || typeNodes.length === 0) {
+    throw new Error(`Work item type '${typeName}' not found in project`);
+  }
+
+  const typeNode = typeNodes[0];
+  const customFieldsWidget = typeNode.widgetDefinitions?.find(
+    (w: any) => w.__typename === "WorkItemWidgetDefinitionCustomFields"
+  );
+
+  const fields = (customFieldsWidget?.customFieldValues || []).map((cfv: any) => {
+    const cf = cfv.customField;
+    const field: Record<string, any> = {
+      id: cf?.id,
+      name: cf?.name,
+      type: cf?.fieldType,
+    };
+    const options = cf?.selectOptions || [];
+    if (options.length > 0) field.selectOptions = options;
+    const types = (cf?.workItemTypes || []).map((t: any) => t.name);
+    if (types.length > 0) field.workItemTypes = types;
+    return field;
+  });
+
+  return {
+    work_item_type: typeNode.name,
+    custom_fields: fields,
+  };
+}
+
+/**
+ * Move a work item to a different project.
+ */
+async function moveWorkItem(
+  projectId: string,
+  iid: number,
+  targetProjectId: string
+): Promise<any> {
+  const projectPath = await resolveProjectPath(projectId);
+  const targetPath = await resolveProjectPath(targetProjectId);
+
+  const data = await executeGraphQL<{
+    issueMove: {
+      issue: { id: string; iid: string; webUrl: string } | null;
+      errors: string[];
+    };
+  }>(
+    `mutation($projectPath: ID!, $iid: String!, $targetProjectPath: ID!) {
+      issueMove(input: { projectPath: $projectPath, iid: $iid, targetProjectPath: $targetProjectPath }) {
+        issue { id iid webUrl }
+        errors
+      }
+    }`,
+    { projectPath: projectPath, iid: String(iid), targetProjectPath: targetPath }
+  );
+
+  if (data.issueMove.errors?.length > 0) {
+    throw new Error(`Failed to move work item: ${data.issueMove.errors.join(", ")}`);
+  }
+
+  return data.issueMove.issue;
+}
+
+/**
+ * List notes/discussions on a work item.
+ */
+async function listWorkItemNotes(
+  projectId: string,
+  iid: number,
+  options: { page_size?: number; after?: string; sort?: string } = {}
+): Promise<any> {
+  const projectPath = await resolveProjectPath(projectId);
+
+  const data = await executeGraphQL<{ namespace: any }>(
+    `query($path: ID!, $iid: String!, $pageSize: Int, $after: String, $sort: WorkItemDiscussionsSort) {
+      namespace(fullPath: $path) {
+        workItem(iid: $iid) {
+          id
+          widgets(onlyTypes: [NOTES]) {
+            ... on WorkItemWidgetNotes {
+              discussionLocked
+              discussions(first: $pageSize, after: $after, filter: ALL_NOTES, sort: $sort) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  id
+                  resolved
+                  resolvable
+                  notes {
+                    nodes {
+                      id
+                      body
+                      system
+                      internal
+                      createdAt
+                      lastEditedAt
+                      author { username }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }`,
+    {
+      path: projectPath,
+      iid: String(iid),
+      pageSize: options.page_size || 20,
+      after: options.after || null,
+      sort: options.sort || "CREATED_ASC",
+    }
+  );
+
+  const workItem = data.namespace?.workItem;
+  if (!workItem) {
+    throw new Error(`Work item #${iid} not found in project ${projectPath}`);
+  }
+
+  const notesWidget = workItem.widgets?.find((w: any) => w.discussions);
+  const discussions = notesWidget?.discussions;
+
+  // Flatten to lean output
+  const items = (discussions?.nodes || []).map((d: any) => {
+    const notes = (d.notes?.nodes || []).map((n: any) => {
+      const note: Record<string, any> = {
+        id: n.id,
+        author: n.author?.username,
+        body: n.body,
+        createdAt: n.createdAt,
+      };
+      if (n.system) note.system = true;
+      if (n.internal) note.internal = true;
+      if (n.lastEditedAt) note.lastEditedAt = n.lastEditedAt;
+      return note;
+    });
+    const discussion: Record<string, any> = { id: d.id, notes };
+    if (d.resolved) discussion.resolved = true;
+    if (d.resolvable) discussion.resolvable = true;
+    return discussion;
+  });
+
+  return {
+    discussions: items,
+    pageInfo: discussions?.pageInfo || {},
+  };
+}
+
+/**
+ * Create a note on a work item.
+ */
+async function createWorkItemNote(
+  projectId: string,
+  iid: number,
+  body: string,
+  options: { internal?: boolean; discussion_id?: string } = {}
+): Promise<any> {
+  const { workItemGID } = await resolveWorkItemGID(projectId, iid);
+
+  const varDefs = ["$noteableId: NoteableID!", "$body: String!"];
+  const inputParts = ["noteableId: $noteableId", "body: $body"];
+  const variables: Record<string, any> = { noteableId: workItemGID, body };
+
+  if (options.internal) {
+    varDefs.push("$internal: Boolean");
+    inputParts.push("internal: $internal");
+    variables.internal = true;
+  }
+
+  if (options.discussion_id) {
+    varDefs.push("$discussionId: DiscussionID");
+    inputParts.push("discussionId: $discussionId");
+    variables.discussionId = options.discussion_id;
+  }
+
+  const data = await executeGraphQL<{
+    createNote: {
+      note: { id: string; body: string; discussion: { id: string } } | null;
+      errors: string[];
+    };
+  }>(
+    `mutation(${varDefs.join(", ")}) {
+      createNote(input: { ${inputParts.join(", ")} }) {
+        note {
+          id
+          body
+          discussion { id }
+        }
+        errors
+      }
+    }`,
+    variables
+  );
+
+  if (data.createNote.errors?.length > 0) {
+    throw new Error(`Failed to create note: ${data.createNote.errors.join(", ")}`);
+  }
+
+  return data.createNote.note;
+}
+
+// --- Incident Timeline Events ---
+
+/**
+ * List timeline events for an incident.
+ */
+async function getTimelineEvents(
+  projectId: string,
+  incidentIid: number
+): Promise<any> {
+  const { workItemGID, projectPath } = await resolveWorkItemGID(projectId, incidentIid);
+  // Timeline events expect gid://gitlab/Issue/... not gid://gitlab/WorkItem/...
+  const incidentGID = workItemGID.replace("/WorkItem/", "/Issue/");
+
+  const data = await executeGraphQL<{ project: any }>(
+    `query($fullPath: ID!, $incidentId: IssueID!) {
+      project(fullPath: $fullPath) {
+        incidentManagementTimelineEvents(incidentId: $incidentId) {
+          nodes {
+            id
+            note
+            noteHtml
+            action
+            occurredAt
+            createdAt
+            timelineEventTags {
+              nodes {
+                id
+                name
+              }
+            }
+          }
+        }
+      }
+    }`,
+    { fullPath: projectPath, incidentId: incidentGID }
+  );
+
+  const events = data.project?.incidentManagementTimelineEvents?.nodes || [];
+
+  return events.map((e: any) => {
+    const event: Record<string, any> = {
+      id: e.id,
+      note: e.note,
+      action: e.action,
+      occurredAt: e.occurredAt,
+      createdAt: e.createdAt,
+    };
+    if (e.noteHtml) event.noteHtml = e.noteHtml;
+    const tags = (e.timelineEventTags?.nodes || []).map((t: any) => t.name);
+    if (tags.length > 0) event.tags = tags;
+    return event;
+  });
+}
+
+/**
+ * Create a timeline event on an incident.
+ */
+async function createTimelineEvent(
+  projectId: string,
+  incidentIid: number,
+  note: string,
+  occurredAt: string,
+  tagNames?: string[]
+): Promise<any> {
+  const { workItemGID } = await resolveWorkItemGID(projectId, incidentIid);
+  // Timeline events expect gid://gitlab/Issue/... not gid://gitlab/WorkItem/...
+  const incidentGID = workItemGID.replace("/WorkItem/", "/Issue/");
+
+  const variables: Record<string, any> = {
+    input: {
+      incidentId: incidentGID,
+      note,
+      occurredAt,
+    },
+  };
+  if (tagNames && tagNames.length > 0) {
+    variables.input.timelineEventTagNames = tagNames;
+  }
+
+  const data = await executeGraphQL<{
+    timelineEventCreate: {
+      timelineEvent: any;
+      errors: string[];
+    };
+  }>(
+    `mutation CreateTimelineEvent($input: TimelineEventCreateInput!) {
+      timelineEventCreate(input: $input) {
+        timelineEvent {
+          id
+          note
+          noteHtml
+          action
+          occurredAt
+          createdAt
+          timelineEventTags {
+            nodes {
+              id
+              name
+            }
+          }
+        }
+        errors
+      }
+    }`,
+    variables
+  );
+
+  if (data.timelineEventCreate.errors?.length > 0) {
+    throw new Error(`Failed to create timeline event: ${data.timelineEventCreate.errors.join(", ")}`);
+  }
+
+  const e = data.timelineEventCreate.timelineEvent;
+  const result: Record<string, any> = {
+    id: e.id,
+    note: e.note,
+    action: e.action,
+    occurredAt: e.occurredAt,
+    createdAt: e.createdAt,
+  };
+  if (e.noteHtml) result.noteHtml = e.noteHtml;
+  const tags = (e.timelineEventTags?.nodes || []).map((t: any) => t.name);
+  if (tags.length > 0) result.tags = tags;
+  return result;
+}
+
+/**
+ * Update the severity of an incident.
+ * Accepts projectPath directly to avoid redundant REST calls when called from updateWorkItem.
+ */
+async function updateIncidentSeverity(
+  projectPath: string,
+  incidentIid: number,
+  severity: string
+): Promise<any> {
+  const data = await executeGraphQL<{
+    issueSetSeverity: {
+      errors: string[];
+      issue: { iid: string; id: string; severity: string } | null;
+    };
+  }>(
+    `mutation($projectPath: ID!, $severity: IssuableSeverity!, $iid: String!) {
+      issueSetSeverity(input: { iid: $iid, severity: $severity, projectPath: $projectPath }) {
+        errors
+        issue {
+          iid
+          id
+          severity
+        }
+      }
+    }`,
+    { projectPath, severity, iid: String(incidentIid) }
+  );
+
+  if (data.issueSetSeverity.errors?.length > 0) {
+    throw new Error(`Failed to set severity: ${data.issueSetSeverity.errors.join(", ")}`);
+  }
+
+  return data.issueSetSeverity.issue;
+}
+
+/**
+ * Update the escalation status of an incident.
+ * Accepts projectPath directly to avoid redundant REST calls when called from updateWorkItem.
+ */
+async function updateIncidentEscalationStatus(
+  projectPath: string,
+  incidentIid: number,
+  status: string
+): Promise<any> {
+  const data = await executeGraphQL<{
+    issueSetEscalationStatus: {
+      errors: string[];
+      issue: { id: string; escalationStatus: string } | null;
+    };
+  }>(
+    `mutation($projectPath: ID!, $status: IssueEscalationStatus!, $iid: String!) {
+      issueSetEscalationStatus(input: { projectPath: $projectPath, status: $status, iid: $iid }) {
+        errors
+        issue {
+          id
+          escalationStatus
+        }
+      }
+    }`,
+    { projectPath, status, iid: String(incidentIid) }
+  );
+
+  if (data.issueSetEscalationStatus.errors?.length > 0) {
+    throw new Error(`Failed to set escalation status: ${data.issueSetEscalationStatus.errors.join(", ")}`);
+  }
+
+  return data.issueSetEscalationStatus.issue;
+}
+
+/**
+ * Resolve a project ID (numeric or path) to its full path_with_namespace.
+ */
+async function resolveProjectPath(projectId: string): Promise<string> {
+  projectId = decodeURIComponent(projectId);
+  const effectiveProjectId = getEffectiveProjectId(projectId);
+  const projectUrl = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(effectiveProjectId)}`
+  );
+  const projectResponse = await fetch(projectUrl.toString(), {
+    ...getFetchConfig(),
+  });
+  await handleGitLabError(projectResponse);
+  const project: any = await projectResponse.json();
+  return project.path_with_namespace;
+}
+
+/**
+ * Get a single work item with all widget data.
+ */
+async function getWorkItem(
+  projectId: string,
+  iid: number
+): Promise<any> {
+  const projectPath = await resolveProjectPath(projectId);
+
+  const data = await executeGraphQL<{
+    namespace: { workItem: any };
+  }>(
+    `query($path: ID!, $iid: String!) {
+      namespace(fullPath: $path) {
+        workItem(iid: $iid) {
+          id
+          iid
+          title
+          state
+          description
+          webUrl
+          confidential
+          author { username }
+          createdAt
+          closedAt
+          workItemType { name }
+          widgets {
+            __typename
+            ... on WorkItemWidgetHierarchy {
+              hasChildren hasParent
+              parent { id iid title webUrl workItemType { name } namespace { fullPath } }
+              children { nodes { id iid title state webUrl workItemType { name } namespace { fullPath } } }
+            }
+            ... on WorkItemWidgetStatus { status { id name category color iconName position } }
+            ... on WorkItemWidgetCustomFields {
+              customFieldValues {
+                __typename
+                customField { id name fieldType }
+                ... on WorkItemNumberFieldValue { value }
+                ... on WorkItemTextFieldValue { value }
+                ... on WorkItemSelectFieldValue {
+                  selectedOptions { id value }
+                }
+              }
+            }
+            ... on WorkItemWidgetLabels { labels { nodes { id title color } } }
+            ... on WorkItemWidgetAssignees { assignees { nodes { id username name } } }
+            ... on WorkItemWidgetWeight { weight rolledUpWeight rolledUpCompletedWeight }
+            ... on WorkItemWidgetHealthStatus { healthStatus }
+            ... on WorkItemWidgetStartAndDueDate { startDate dueDate }
+            ... on WorkItemWidgetMilestone { milestone { id title } }
+            ... on WorkItemWidgetLinkedItems {
+              blocked blockedByCount blockingCount
+              linkedItems { nodes { linkType workItem { id iid title state webUrl workItemType { name } namespace { fullPath } } } }
+            }
+            ... on WorkItemWidgetTimeTracking {
+              timeEstimate totalTimeSpent
+            }
+            ... on WorkItemWidgetDevelopment {
+              willAutoCloseByMergeRequest
+              relatedBranches { nodes { name } }
+              relatedMergeRequests {
+                nodes { iid title webUrl state sourceBranch }
+              }
+              closingMergeRequests {
+                nodes {
+                  mergeRequest { iid title webUrl state sourceBranch }
+                }
+              }
+              featureFlags { nodes { name active } }
+            }
+            ... on WorkItemWidgetIteration {
+              iteration { id title startDate dueDate webUrl iterationCadence { id title } }
+            }
+            ... on WorkItemWidgetProgress { progress }
+            ... on WorkItemWidgetColor { color textColor }
+          }
+        }
+      }
+    }`,
+    { path: projectPath, iid: String(iid) }
+  );
+
+  if (!data.namespace?.workItem) {
+    throw new Error(`Work item #${iid} not found in project ${projectPath}`);
+  }
+
+  const wi = data.namespace.workItem;
+  const widgets = wi.widgets || [];
+
+  // Flatten widget data into a clean response
+  const hierarchyWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetHierarchy");
+  const statusWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetStatus");
+  const labelsWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetLabels");
+  const assigneesWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetAssignees");
+  const weightWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetWeight");
+  const healthStatusWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetHealthStatus");
+  const datesWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetStartAndDueDate");
+  const milestoneWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetMilestone");
+  const linkedItemsWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetLinkedItems");
+  const timeTrackingWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetTimeTracking");
+  const developmentWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetDevelopment");
+  const customFieldsWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetCustomFields");
+
+  // Build response, omitting null/empty values to keep output lean
+  const result: Record<string, any> = {
+    id: wi.id,
+    iid: wi.iid,
+    title: wi.title,
+    state: wi.state,
+    type: wi.workItemType?.name,
+    webUrl: wi.webUrl,
+  };
+
+  if (wi.description) result.description = wi.description;
+  if (wi.confidential) result.confidential = true;
+  if (wi.author?.username) result.author = wi.author.username;
+  if (wi.createdAt) result.createdAt = wi.createdAt;
+  if (wi.closedAt) result.closedAt = wi.closedAt;
+  if (statusWidget?.status) result.status = { name: statusWidget.status.name, id: statusWidget.status.id, category: statusWidget.status.category };
+
+  const labels = (labelsWidget?.labels?.nodes || []).map((l: any) => l.title);
+  if (labels.length > 0) result.labels = labels;
+
+  const assignees = (assigneesWidget?.assignees?.nodes || []).map((a: any) => a.username);
+  if (assignees.length > 0) result.assignees = assignees;
+
+  if (weightWidget?.weight != null) {
+    result.weight = weightWidget.weight;
+    if (weightWidget.rolledUpWeight != null) result.rolledUpWeight = weightWidget.rolledUpWeight;
+    if (weightWidget.rolledUpCompletedWeight != null) result.rolledUpCompletedWeight = weightWidget.rolledUpCompletedWeight;
+  }
+  if (healthStatusWidget?.healthStatus) result.healthStatus = healthStatusWidget.healthStatus;
+  if (datesWidget?.startDate) result.startDate = datesWidget.startDate;
+  if (datesWidget?.dueDate) result.dueDate = datesWidget.dueDate;
+  if (milestoneWidget?.milestone) result.milestone = { id: milestoneWidget.milestone.id, title: milestoneWidget.milestone.title };
+
+  const iterationWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetIteration");
+  if (iterationWidget?.iteration) {
+    result.iteration = {
+      id: iterationWidget.iteration.id,
+      title: iterationWidget.iteration.title,
+      startDate: iterationWidget.iteration.startDate,
+      dueDate: iterationWidget.iteration.dueDate,
+    };
+  }
+
+  const progressWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetProgress");
+  if (progressWidget?.progress != null) result.progress = progressWidget.progress;
+
+  const colorWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetColor");
+  if (colorWidget?.color) result.color = colorWidget.color;
+
+  if (hierarchyWidget?.parent) result.parent = { iid: hierarchyWidget.parent.iid, title: hierarchyWidget.parent.title, type: hierarchyWidget.parent.workItemType?.name, project: hierarchyWidget.parent.namespace?.fullPath, webUrl: hierarchyWidget.parent.webUrl };
+  const children = hierarchyWidget?.children?.nodes || [];
+  if (children.length > 0) result.children = children.map((c: any) => ({ iid: c.iid, title: c.title, state: c.state, type: c.workItemType?.name, project: c.namespace?.fullPath, webUrl: c.webUrl }));
+
+  if (linkedItemsWidget?.blocked) result.blocked = true;
+  if (linkedItemsWidget?.blockedByCount > 0) result.blockedByCount = linkedItemsWidget.blockedByCount;
+  if (linkedItemsWidget?.blockingCount > 0) result.blockingCount = linkedItemsWidget.blockingCount;
+  const linkedNodes = linkedItemsWidget?.linkedItems?.nodes || [];
+  if (linkedNodes.length > 0) {
+    result.linkedItems = linkedNodes.map((n: any) => ({
+      linkType: n.linkType,
+      iid: n.workItem?.iid,
+      title: n.workItem?.title,
+      state: n.workItem?.state,
+      type: n.workItem?.workItemType?.name,
+      project: n.workItem?.namespace?.fullPath,
+      webUrl: n.workItem?.webUrl,
+    }));
+  }
+
+  if (timeTrackingWidget?.timeEstimate > 0) result.timeEstimate = timeTrackingWidget.timeEstimate;
+  if (timeTrackingWidget?.totalTimeSpent > 0) result.totalTimeSpent = timeTrackingWidget.totalTimeSpent;
+
+  // Development: only include if there's actual data
+  const relatedMRs = developmentWidget?.relatedMergeRequests?.nodes || [];
+  const closingMRs = (developmentWidget?.closingMergeRequests?.nodes || []).map((n: any) => n.mergeRequest);
+  const branches = developmentWidget?.relatedBranches?.nodes || [];
+  const flags = developmentWidget?.featureFlags?.nodes || [];
+  if (relatedMRs.length > 0 || closingMRs.length > 0 || branches.length > 0 || flags.length > 0) {
+    const dev: Record<string, any> = {};
+    if (relatedMRs.length > 0) dev.relatedMergeRequests = relatedMRs;
+    if (closingMRs.length > 0) dev.closingMergeRequests = closingMRs;
+    if (branches.length > 0) dev.relatedBranches = branches.map((b: any) => b.name);
+    if (flags.length > 0) dev.featureFlags = flags;
+    result.development = dev;
+  }
+
+  const cfValues = (customFieldsWidget?.customFieldValues || []).filter((cfv: any) => cfv.value != null || cfv.selectedOptions != null);
+  if (cfValues.length > 0) {
+    result.customFields = cfValues.map((cfv: any) => ({
+      name: cfv.customField?.name,
+      type: cfv.customField?.fieldType,
+      value: cfv.value ?? cfv.selectedOptions ?? null,
+    }));
+  }
+
+  return result;
+}
+
+/**
+ * List work items in a project with filters.
+ */
+async function listWorkItems(
+  projectId: string,
+  options: {
+    types?: string[];
+    state?: string;
+    search?: string;
+    assignee_usernames?: string[];
+    label_names?: string[];
+    first?: number;
+    after?: string;
+  }
+): Promise<any> {
+  const projectPath = await resolveProjectPath(projectId);
+
+  // Map type names to GraphQL enum values
+  const typeMap: Record<string, string> = {
+    issue: "ISSUE",
+    task: "TASK",
+    incident: "INCIDENT",
+    test_case: "TEST_CASE",
+    epic: "EPIC",
+    key_result: "KEY_RESULT",
+    objective: "OBJECTIVE",
+    requirement: "REQUIREMENT",
+    ticket: "TICKET",
+  };
+
+  const variables: Record<string, any> = {
+    path: projectPath,
+    first: options.first || 20,
+  };
+
+  if (options.types && options.types.length > 0) {
+    variables.types = options.types.map((t) => typeMap[t] || t.replace(/ /g, "_").toUpperCase());
+  }
+  if (options.state) {
+    variables.state = options.state === "opened" ? "opened" : "closed";
+  }
+  if (options.search) {
+    variables.search = options.search;
+  }
+  if (options.assignee_usernames && options.assignee_usernames.length > 0) {
+    variables.assigneeUsernames = options.assignee_usernames;
+  }
+  if (options.label_names && options.label_names.length > 0) {
+    variables.labelName = options.label_names;
+  }
+  if (options.after) {
+    variables.after = options.after;
+  }
+
+  const data = await executeGraphQL<{ project: any }>(
+    `query($path: ID!, $types: [IssueType!], $state: IssuableState, $search: String, $assigneeUsernames: [String!], $labelName: [String!], $first: Int, $after: String) {
+      project(fullPath: $path) {
+        workItems(types: $types, state: $state, search: $search, assigneeUsernames: $assigneeUsernames, labelName: $labelName, first: $first, after: $after) {
+          nodes {
+            id iid title state webUrl workItemType { name }
+            widgets {
+              __typename
+              ... on WorkItemWidgetStatus { status { id name category color } }
+              ... on WorkItemWidgetLabels { labels { nodes { title } } }
+              ... on WorkItemWidgetAssignees { assignees { nodes { username } } }
+              ... on WorkItemWidgetWeight { weight }
+              ... on WorkItemWidgetHealthStatus { healthStatus }
+              ... on WorkItemWidgetStartAndDueDate { startDate dueDate }
+              ... on WorkItemWidgetMilestone { milestone { id title } }
+            }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }`,
+    variables
+  );
+
+  const workItems = data.project?.workItems?.nodes || [];
+  const pageInfo = data.project?.workItems?.pageInfo || {};
+
+  // Flatten widget data for each item
+  const items = workItems.map((wi: any) => {
+    const widgets = wi.widgets || [];
+    const statusWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetStatus");
+    const labelsWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetLabels");
+    const assigneesWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetAssignees");
+    const weightWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetWeight");
+    const healthStatusWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetHealthStatus");
+    const datesWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetStartAndDueDate");
+    const milestoneWidget = widgets.find((w: any) => w.__typename === "WorkItemWidgetMilestone");
+    const item: Record<string, any> = {
+      iid: wi.iid,
+      title: wi.title,
+      state: wi.state,
+      type: wi.workItemType?.name,
+      webUrl: wi.webUrl,
+    };
+    if (statusWidget?.status) item.status = statusWidget.status.name;
+    const labels = (labelsWidget?.labels?.nodes || []).map((l: any) => l.title);
+    if (labels.length > 0) item.labels = labels;
+    const assignees = (assigneesWidget?.assignees?.nodes || []).map((a: any) => a.username);
+    if (assignees.length > 0) item.assignees = assignees;
+    if (weightWidget?.weight != null) item.weight = weightWidget.weight;
+    if (healthStatusWidget?.healthStatus) item.healthStatus = healthStatusWidget.healthStatus;
+    if (datesWidget?.startDate) item.startDate = datesWidget.startDate;
+    if (datesWidget?.dueDate) item.dueDate = datesWidget.dueDate;
+    if (milestoneWidget?.milestone) item.milestone = milestoneWidget.milestone.title;
+    return item;
+  });
+
+  return { items, pageInfo };
+}
+
+/**
+ * Create a new work item using GraphQL.
+ */
+async function createWorkItem(
+  projectId: string,
+  options: {
+    title: string;
+    type?: string;
+    description?: string;
+    labels?: string[];
+    assignee_usernames?: string[];
+    parent_iid?: number;
+    weight?: number;
+    health_status?: string;
+    start_date?: string;
+    due_date?: string;
+    milestone_id?: string;
+    iteration_id?: string;
+    confidential?: boolean;
+  }
+): Promise<any> {
+  const projectPath = await resolveProjectPath(projectId);
+  const typeName = options.type || "issue";
+  const typeGID = await resolveWorkItemTypeGID(projectPath, typeName);
+
+  // Build the input dynamically - only include widgets that have values
+  const inputFields: string[] = [
+    "$projectPath: ID!",
+    "$title: String!",
+    "$typeId: WorkItemsTypeID!",
+  ];
+  const inputValues: string[] = [
+    "namespacePath: $projectPath",
+    "title: $title",
+    "workItemTypeId: $typeId",
+  ];
+  const variables: Record<string, any> = {
+    projectPath,
+    title: options.title,
+    typeId: typeGID,
+  };
+
+  if (options.description !== undefined) {
+    inputFields.push("$description: String!");
+    inputValues.push("descriptionWidget: { description: $description }");
+    variables.description = options.description;
+  }
+
+  // Resolve label names and usernames to GIDs in a single GraphQL call
+  const { labelIds, userIds } = await resolveNamesToIds(
+    projectPath,
+    options.labels,
+    options.assignee_usernames
+  );
+
+  if (labelIds.length > 0) {
+    inputFields.push("$labelIds: [LabelID!]!");
+    inputValues.push("labelsWidget: { labelIds: $labelIds }");
+    variables.labelIds = labelIds;
+  }
+
+  // Incidents don't support the weight widget
+  if (options.weight !== undefined && typeName !== "incident") {
+    inputFields.push("$weight: Int");
+    inputValues.push("weightWidget: { weight: $weight }");
+    variables.weight = options.weight;
+  }
+
+  // Resolve parent GID if provided
+  if (options.parent_iid !== undefined) {
+    const { workItemGID: parentGID } = await resolveWorkItemGID(projectId, options.parent_iid);
+    inputFields.push("$parentId: WorkItemID");
+    inputValues.push("hierarchyWidget: { parentId: $parentId }");
+    variables.parentId = parentGID;
+  }
+
+  if (userIds.length > 0) {
+    inputFields.push("$assigneeIds: [UserID!]!");
+    inputValues.push("assigneesWidget: { assigneeIds: $assigneeIds }");
+    variables.assigneeIds = userIds;
+  }
+
+  if (options.health_status !== undefined) {
+    inputFields.push("$healthStatus: HealthStatus");
+    inputValues.push("healthStatusWidget: { healthStatus: $healthStatus }");
+    variables.healthStatus = options.health_status;
+  }
+
+  // Start and due date widget - combine into one widget
+  if (options.start_date !== undefined || options.due_date !== undefined) {
+    const dateParts: string[] = [];
+    if (options.start_date !== undefined) {
+      inputFields.push("$startDate: Date");
+      dateParts.push("startDate: $startDate");
+      variables.startDate = options.start_date;
+    }
+    if (options.due_date !== undefined) {
+      inputFields.push("$dueDate: Date");
+      dateParts.push("dueDate: $dueDate");
+      variables.dueDate = options.due_date;
+    }
+    inputValues.push(`startAndDueDateWidget: { ${dateParts.join(", ")} }`);
+  }
+
+  if (options.milestone_id !== undefined) {
+    // Convert numeric ID to GID format if needed
+    const milestoneGID = options.milestone_id.startsWith("gid://")
+      ? options.milestone_id
+      : `gid://gitlab/Milestone/${options.milestone_id}`;
+    inputFields.push("$milestoneId: MilestoneID");
+    inputValues.push("milestoneWidget: { milestoneId: $milestoneId }");
+    variables.milestoneId = milestoneGID;
+  }
+
+  if (options.iteration_id !== undefined) {
+    const iterationGID = options.iteration_id.startsWith("gid://")
+      ? options.iteration_id
+      : `gid://gitlab/Iteration/${options.iteration_id}`;
+    inputFields.push("$iterationId: IterationID");
+    inputValues.push("iterationWidget: { iterationId: $iterationId }");
+    variables.iterationId = iterationGID;
+  }
+
+  if (options.confidential !== undefined) {
+    inputFields.push("$confidential: Boolean");
+    inputValues.push("confidential: $confidential");
+    variables.confidential = options.confidential;
+  }
+
+  const mutation = `mutation(${inputFields.join(", ")}) {
+    workItemCreate(input: { ${inputValues.join(", ")} }) {
+      workItem {
+        id
+        iid
+        title
+        webUrl
+        workItemType { name }
+      }
+      errors
+    }
+  }`;
+
+  const data = await executeGraphQL<{
+    workItemCreate: {
+      workItem: any;
+      errors: string[];
+    };
+  }>(mutation, variables);
+
+  if (data.workItemCreate.errors?.length > 0) {
+    throw new Error(`Failed to create work item: ${data.workItemCreate.errors.join(", ")}`);
+  }
+
+  const wi = data.workItemCreate.workItem;
+  return {
+    id: wi.id,
+    iid: wi.iid,
+    title: wi.title,
+    type: wi.workItemType?.name,
+    webUrl: wi.webUrl,
+  };
+}
+
+/**
+ * Update a work item - consolidated handler for title, description, labels, assignees,
+ * weight, state, status, parent, and children operations.
+ */
+async function updateWorkItem(
+  projectId: string,
+  iid: number,
+  options: {
+    title?: string;
+    description?: string;
+    add_labels?: string[];
+    remove_labels?: string[];
+    assignee_usernames?: string[];
+    state_event?: string;
+    weight?: number;
+    status?: string;
+    parent_iid?: number;
+    parent_project_id?: string;
+    remove_parent?: boolean;
+    children_to_add?: Array<{ project_id?: string; iid: number }>;
+    children_to_remove?: Array<{ project_id?: string; iid: number }>;
+    health_status?: string;
+    start_date?: string;
+    due_date?: string;
+    milestone_id?: string;
+    iteration_id?: string;
+    confidential?: boolean;
+    linked_items_to_add?: Array<{ project_id?: string; iid: number; link_type?: string }>;
+    linked_items_to_remove?: Array<{ project_id?: string; iid: number }>;
+    custom_fields?: Array<{
+      custom_field_id: string;
+      text_value?: string;
+      number_value?: number;
+      selected_option_ids?: string[];
+      date_value?: string;
+    }>;
+    severity?: string;
+    escalation_status?: string;
+  }
+): Promise<any> {
+  const { workItemGID, projectPath } = await resolveWorkItemGID(projectId, iid);
+
+  // Build the main workItemUpdate mutation dynamically
+  const inputParts: string[] = ["id: $id"];
+  const varDefs: string[] = ["$id: WorkItemID!"];
+  const variables: Record<string, any> = { id: workItemGID };
+
+  if (options.title !== undefined) {
+    varDefs.push("$title: String");
+    inputParts.push("title: $title");
+    variables.title = options.title;
+  }
+
+  if (options.description !== undefined) {
+    varDefs.push("$description: String!");
+    inputParts.push("descriptionWidget: { description: $description }");
+    variables.description = options.description;
+  }
+
+  // Resolve label names and usernames to GIDs in a single GraphQL call
+  const allLabelNames = [...(options.add_labels || []), ...(options.remove_labels || [])];
+  const needsResolve = allLabelNames.length > 0 || options.assignee_usernames?.length;
+  const { labelIds: resolvedLabelIds, userIds } = needsResolve
+    ? await resolveNamesToIds(
+        projectPath,
+        allLabelNames.length > 0 ? allLabelNames : undefined,
+        options.assignee_usernames
+      )
+    : { labelIds: [] as string[], userIds: [] as string[] };
+
+  if (options.add_labels || options.remove_labels) {
+    const labelParts: string[] = [];
+    let offset = 0;
+
+    if (options.add_labels && options.add_labels.length > 0) {
+      const addIds = resolvedLabelIds.slice(0, options.add_labels.length);
+      offset = options.add_labels.length;
+      varDefs.push("$addLabelIds: [LabelID!]");
+      labelParts.push("addLabelIds: $addLabelIds");
+      variables.addLabelIds = addIds;
+    }
+    if (options.remove_labels && options.remove_labels.length > 0) {
+      const removeIds = resolvedLabelIds.slice(offset);
+      varDefs.push("$removeLabelIds: [LabelID!]");
+      labelParts.push("removeLabelIds: $removeLabelIds");
+      variables.removeLabelIds = removeIds;
+    }
+
+    if (labelParts.length > 0) {
+      inputParts.push(`labelsWidget: { ${labelParts.join(", ")} }`);
+    }
+  }
+
+  if (userIds.length > 0) {
+    varDefs.push("$assigneeIds: [UserID!]!");
+    inputParts.push("assigneesWidget: { assigneeIds: $assigneeIds }");
+    variables.assigneeIds = userIds;
+  }
+
+  if (options.state_event !== undefined) {
+    varDefs.push("$stateEvent: WorkItemStateEvent");
+    inputParts.push("stateEvent: $stateEvent");
+    variables.stateEvent = options.state_event === "close" ? "CLOSE" : "REOPEN";
+  }
+
+  if (options.weight !== undefined) {
+    varDefs.push("$weight: Int");
+    inputParts.push("weightWidget: { weight: $weight }");
+    variables.weight = options.weight;
+  }
+
+  if (options.status !== undefined) {
+    varDefs.push("$status: WorkItemsStatusesStatusID");
+    inputParts.push("statusWidget: { status: $status }");
+    variables.status = options.status;
+  }
+
+  if (options.health_status !== undefined) {
+    varDefs.push("$healthStatus: HealthStatus");
+    inputParts.push("healthStatusWidget: { healthStatus: $healthStatus }");
+    variables.healthStatus = options.health_status;
+  }
+
+  // Start and due date widget - combine into one widget
+  if (options.start_date !== undefined || options.due_date !== undefined) {
+    const dateParts: string[] = [];
+    if (options.start_date !== undefined) {
+      varDefs.push("$startDate: Date");
+      dateParts.push("startDate: $startDate");
+      variables.startDate = options.start_date;
+    }
+    if (options.due_date !== undefined) {
+      varDefs.push("$dueDate: Date");
+      dateParts.push("dueDate: $dueDate");
+      variables.dueDate = options.due_date;
+    }
+    inputParts.push(`startAndDueDateWidget: { ${dateParts.join(", ")} }`);
+  }
+
+  if (options.milestone_id !== undefined) {
+    // Convert numeric ID to GID format if needed
+    const milestoneGID = options.milestone_id.startsWith("gid://")
+      ? options.milestone_id
+      : `gid://gitlab/Milestone/${options.milestone_id}`;
+    varDefs.push("$milestoneId: MilestoneID");
+    inputParts.push("milestoneWidget: { milestoneId: $milestoneId }");
+    variables.milestoneId = milestoneGID;
+  }
+
+  if (options.iteration_id !== undefined) {
+    const iterationGID = options.iteration_id.startsWith("gid://")
+      ? options.iteration_id
+      : `gid://gitlab/Iteration/${options.iteration_id}`;
+    varDefs.push("$iterationId: IterationID");
+    inputParts.push("iterationWidget: { iterationId: $iterationId }");
+    variables.iterationId = iterationGID;
+  }
+
+  if (options.confidential !== undefined) {
+    varDefs.push("$confidential: Boolean");
+    inputParts.push("confidential: $confidential");
+    variables.confidential = options.confidential;
+  }
+
+  // Custom fields widget
+  if (options.custom_fields && options.custom_fields.length > 0) {
+    const cfValues = options.custom_fields.map(cf => {
+      const cfId = cf.custom_field_id.startsWith("gid://")
+        ? cf.custom_field_id
+        : `gid://gitlab/IssuablesCustomField/${cf.custom_field_id}`;
+      const val: any = { customFieldId: cfId };
+      if (cf.text_value !== undefined) val.textValue = cf.text_value;
+      if (cf.number_value !== undefined) val.numberValue = cf.number_value;
+      if (cf.selected_option_ids !== undefined) val.selectedOptionIds = cf.selected_option_ids;
+      if (cf.date_value !== undefined) val.dateValue = cf.date_value;
+      return val;
+    });
+    varDefs.push("$customFieldsWidget: [WorkItemWidgetCustomFieldValueInputType!]");
+    inputParts.push("customFieldsWidget: $customFieldsWidget");
+    variables.customFieldsWidget = cfValues;
+  }
+
+  // Hierarchy: set parent or remove parent
+  if (options.remove_parent) {
+    inputParts.push("hierarchyWidget: { parentId: null }");
+  } else if (options.parent_iid !== undefined) {
+    const parentProjectId = options.parent_project_id || projectId;
+    const { workItemGID: parentGID } = await resolveWorkItemGID(parentProjectId, options.parent_iid);
+    varDefs.push("$parentId: WorkItemID");
+    inputParts.push("hierarchyWidget: { parentId: $parentId }");
+    variables.parentId = parentGID;
+  }
+
+  // Execute the main update mutation
+  const mutation = `mutation(${varDefs.join(", ")}) {
+    workItemUpdate(input: { ${inputParts.join(", ")} }) {
+      workItem {
+        id
+        iid
+        title
+        state
+        webUrl
+        workItemType { name }
+        widgets {
+          __typename
+          ... on WorkItemWidgetStatus { status { id name category color } }
+          ... on WorkItemWidgetLabels { labels { nodes { title } } }
+          ... on WorkItemWidgetAssignees { assignees { nodes { username } } }
+          ... on WorkItemWidgetWeight { weight }
+          ... on WorkItemWidgetHierarchy {
+            parent { id title workItemType { name } }
+          }
+          ... on WorkItemWidgetHealthStatus { healthStatus }
+          ... on WorkItemWidgetStartAndDueDate { startDate dueDate }
+          ... on WorkItemWidgetMilestone { milestone { id title } }
+        }
+      }
+      errors
+    }
+  }`;
+
+  const data = await executeGraphQL<{
+    workItemUpdate: { workItem: any; errors: string[] };
+  }>(mutation, variables);
+
+  if (data.workItemUpdate.errors?.length > 0) {
+    throw new Error(`Failed to update work item: ${data.workItemUpdate.errors.join(", ")}`);
+  }
+
+  // Handle children_to_add: use separate workItemUpdate call with hierarchyWidget.childrenIds
+  if (options.children_to_add && options.children_to_add.length > 0) {
+    const childGIDs: string[] = [];
+    for (const child of options.children_to_add) {
+      const { workItemGID: childGID } = await resolveWorkItemGID(child.project_id || projectId, child.iid);
+      childGIDs.push(childGID);
+    }
+    const addData = await executeGraphQL<{
+      workItemUpdate: { errors: string[] };
+    }>(
+      `mutation($id: WorkItemID!, $childrenIds: [WorkItemID!]!) {
+        workItemUpdate(input: { id: $id, hierarchyWidget: { childrenIds: $childrenIds } }) {
+          errors
+        }
+      }`,
+      { id: workItemGID, childrenIds: childGIDs }
+    );
+    if (addData.workItemUpdate.errors?.length > 0) {
+      throw new Error(`Failed to add children: ${addData.workItemUpdate.errors.join(", ")}`);
+    }
+  }
+
+  // Handle children_to_remove: remove parent from each child
+  if (options.children_to_remove && options.children_to_remove.length > 0) {
+    for (const child of options.children_to_remove) {
+      await removeIssueParent(child.project_id || projectId, child.iid);
+    }
+  }
+
+  // Handle linked_items_to_add: use workItemAddLinkedItems mutation
+  if (options.linked_items_to_add && options.linked_items_to_add.length > 0) {
+    // Group by link_type since each mutation call needs a single linkType
+    const groupedByType: Record<string, string[]> = {};
+    for (const item of options.linked_items_to_add) {
+      const linkType = item.link_type || "RELATED";
+      if (!groupedByType[linkType]) groupedByType[linkType] = [];
+      const { workItemGID: targetGID } = await resolveWorkItemGID(item.project_id || projectId, item.iid);
+      groupedByType[linkType].push(targetGID);
+    }
+    for (const [linkType, targetGIDs] of Object.entries(groupedByType)) {
+      const addLinkedData = await executeGraphQL<{
+        workItemAddLinkedItems: { errors: string[] };
+      }>(
+        `mutation($id: WorkItemID!, $workItemsIds: [WorkItemID!]!, $linkType: WorkItemRelatedLinkType!) {
+          workItemAddLinkedItems(input: { id: $id, workItemsIds: $workItemsIds, linkType: $linkType }) {
+            errors
+          }
+        }`,
+        { id: workItemGID, workItemsIds: targetGIDs, linkType }
+      );
+      if (addLinkedData.workItemAddLinkedItems.errors?.length > 0) {
+        throw new Error(`Failed to add linked items: ${addLinkedData.workItemAddLinkedItems.errors.join(", ")}`);
+      }
+    }
+  }
+
+  // Handle linked_items_to_remove: use workItemRemoveLinkedItems mutation
+  if (options.linked_items_to_remove && options.linked_items_to_remove.length > 0) {
+    const targetGIDs: string[] = [];
+    for (const item of options.linked_items_to_remove) {
+      const { workItemGID: targetGID } = await resolveWorkItemGID(item.project_id || projectId, item.iid);
+      targetGIDs.push(targetGID);
+    }
+    const removeLinkedData = await executeGraphQL<{
+      workItemRemoveLinkedItems: { errors: string[] };
+    }>(
+      `mutation($id: WorkItemID!, $workItemsIds: [WorkItemID!]!) {
+        workItemRemoveLinkedItems(input: { id: $id, workItemsIds: $workItemsIds }) {
+          errors
+        }
+      }`,
+      { id: workItemGID, workItemsIds: targetGIDs }
+    );
+    if (removeLinkedData.workItemRemoveLinkedItems.errors?.length > 0) {
+      throw new Error(`Failed to remove linked items: ${removeLinkedData.workItemRemoveLinkedItems.errors.join(", ")}`);
+    }
+  }
+
+  // Handle incident-specific fields via separate mutations
+  if (options.severity !== undefined) {
+    await updateIncidentSeverity(projectPath, iid, options.severity);
+  }
+  if (options.escalation_status !== undefined) {
+    await updateIncidentEscalationStatus(projectPath, iid, options.escalation_status);
+  }
+
+  // Flatten the response
+  const wi = data.workItemUpdate.workItem;
+  const widgets = wi?.widgets || [];
+  const statusW = widgets.find((w: any) => w.__typename === "WorkItemWidgetStatus");
+  const labelsW = widgets.find((w: any) => w.__typename === "WorkItemWidgetLabels");
+  const assigneesW = widgets.find((w: any) => w.__typename === "WorkItemWidgetAssignees");
+  const weightW = widgets.find((w: any) => w.__typename === "WorkItemWidgetWeight");
+  const hierarchyW = widgets.find((w: any) => w.__typename === "WorkItemWidgetHierarchy");
+  const healthStatusW = widgets.find((w: any) => w.__typename === "WorkItemWidgetHealthStatus");
+  const datesW = widgets.find((w: any) => w.__typename === "WorkItemWidgetStartAndDueDate");
+  const milestoneW = widgets.find((w: any) => w.__typename === "WorkItemWidgetMilestone");
+
+  return {
+    id: wi.id,
+    iid: wi.iid,
+    title: wi.title,
+    state: wi.state,
+    type: wi.workItemType?.name,
+    webUrl: wi.webUrl,
+    status: statusW?.status || null,
+    labels: (labelsW?.labels?.nodes || []).map((l: any) => l.title),
+    assignees: (assigneesW?.assignees?.nodes || []).map((a: any) => a.username),
+    weight: weightW?.weight ?? null,
+    parent: hierarchyW?.parent || null,
+    healthStatus: healthStatusW?.healthStatus || null,
+    startDate: datesW?.startDate || null,
+    dueDate: datesW?.dueDate || null,
+    milestone: milestoneW?.milestone || null,
+    children_added: options.children_to_add?.length || 0,
+    children_removed: options.children_to_remove?.length || 0,
+    linked_items_added: options.linked_items_to_add?.length || 0,
+    linked_items_removed: options.linked_items_to_remove?.length || 0,
+    ...(options.severity !== undefined && { severity: options.severity }),
+    ...(options.escalation_status !== undefined && { escalation_status: options.escalation_status }),
+  };
 }
 
 /**
@@ -2171,19 +3622,37 @@ async function updateMergeRequestDiscussionNote(
 
 /**
  * Update an issue discussion note
+ *
+ * Note: Only one of `body` or `resolved` can be provided per GitLab API requirements.
+ * At least one parameter must be provided.
+ *
  * @param {string} projectId - The ID or URL-encoded path of the project
- * @param {number} issueIid - The IID of an issue
+ * @param {number|string} issueIid - The IID of an issue
  * @param {string} discussionId - The ID of a thread
- * @param {number} noteId - The ID of a thread note
- * @param {string} body - The new content of the note
+ * @param {number|string} noteId - The ID of a thread note
+ * @param {string} [body] - The new content of the note (optional, mutually exclusive with resolved)
+ * @param {boolean} [resolved] - Resolve (true) or unresolve (false) the thread (optional, mutually exclusive with body)
  * @returns {Promise<GitLabDiscussionNote>} The updated note
+ *
+ * @example
+ * // Resolve a thread
+ * await updateIssueNote('mygroup/myproject', 123, 'abc123', 456, undefined, true);
+ *
+ * @example
+ * // Unresolve a thread
+ * await updateIssueNote('mygroup/myproject', 123, 'abc123', 456, undefined, false);
+ *
+ * @example
+ * // Update note body
+ * await updateIssueNote('mygroup/myproject', 123, 'abc123', 456, 'Updated content');
  */
 async function updateIssueNote(
   projectId: string,
   issueIid: number | string,
   discussionId: string,
   noteId: number | string,
-  body: string
+  body?: string,
+  resolved?: boolean
 ): Promise<GitLabDiscussionNote> {
   projectId = decodeURIComponent(projectId); // Decode project ID
   const url = new URL(
@@ -2192,7 +3661,13 @@ async function updateIssueNote(
     )}/issues/${issueIid}/discussions/${discussionId}/notes/${noteId}`
   );
 
-  const payload = { body };
+  // Only one of body or resolved can be sent according to GitLab API
+  const payload: { body?: string; resolved?: boolean } = {};
+  if (body !== undefined) {
+    payload.body = body;
+  } else if (resolved !== undefined) {
+    payload.resolved = resolved;
+  }
 
   const response = await fetch(url.toString(), {
     ...getFetchConfig(),
@@ -2209,7 +3684,7 @@ async function updateIssueNote(
  * Create a note in an issue discussion
  * @param {string} projectId - The ID or URL-encoded path of the project
  * @param {number} issueIid - The IID of an issue
- * @param {string} discussionId - The ID of a thread
+ * @param {string} [discussionId] - The ID of a thread (omit for top-level note)
  * @param {string} body - The content of the new note
  * @param {string} [createdAt] - The creation date of the note (ISO 8601 format)
  * @returns {Promise<GitLabDiscussionNote>} The created note
@@ -2217,15 +3692,18 @@ async function updateIssueNote(
 async function createIssueNote(
   projectId: string,
   issueIid: number | string,
-  discussionId: string,
+  discussionId: string | undefined,
   body: string,
   createdAt?: string
 ): Promise<GitLabDiscussionNote> {
   projectId = decodeURIComponent(projectId); // Decode project ID
+  const basePath = `${getEffectiveApiUrl()}/projects/${encodeURIComponent(
+    getEffectiveProjectId(projectId)
+  )}/issues/${issueIid}`;
   const url = new URL(
-    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(
-      getEffectiveProjectId(projectId)
-    )}/issues/${issueIid}/discussions/${discussionId}/notes`
+    discussionId
+      ? `${basePath}/discussions/${discussionId}/notes`
+      : `${basePath}/notes`
   );
 
   const payload: { body: string; created_at?: string } = { body };
@@ -2363,7 +3841,9 @@ async function getMergeRequestNotes(
   projectId: string,
   mergeRequestIid: string,
   sort?: "asc" | "desc",
-  order_by?: "created_at" | "updated_at"
+  order_by?: "created_at" | "updated_at",
+  per_page?: number,
+  page?: number
 ): Promise<GitLabDiscussionNote[]> {
   projectId = decodeURIComponent(projectId); // Decode project ID
   const url = new URL(
@@ -2378,6 +3858,14 @@ async function getMergeRequestNotes(
 
   if (order_by) {
     url.searchParams.append("order_by", order_by);
+  }
+
+  if (per_page) {
+    url.searchParams.append("per_page", per_page.toString());
+  }
+
+  if (page) {
+    url.searchParams.append("page", page.toString());
   }
 
   const response = await fetch(url.toString(), {
@@ -2421,6 +3909,13 @@ async function updateMergeRequestNote(
   return GitLabDiscussionNoteSchema.parse(data);
 }
 
+function encodeRepoFilePayloadContent(content: string): string {
+  if (GITLAB_REPO_FILE_ENCODING === "base64") {
+    return Buffer.from(content).toString("base64");
+  }
+  return content;
+}
+
 /**
  * Create or update a file in a GitLab project
  * 파일 생성 또는 업데이트
@@ -2451,9 +3946,9 @@ async function createOrUpdateFile(
 
   const body: Record<string, any> = {
     branch,
-    content,
+    content: encodeRepoFilePayloadContent(content),
     commit_message: commitMessage,
-    encoding: "text",
+    encoding: GITLAB_REPO_FILE_ENCODING,
     ...(previousPath ? { previous_path: previousPath } : {}),
   };
 
@@ -2509,55 +4004,6 @@ async function createOrUpdateFile(
 }
 
 /**
- * Create a tree structure in a GitLab project repository
- * 저장소에 트리 구조 생성
- *
- * @param {string} projectId - The ID or URL-encoded path of the project
- * @param {FileOperation[]} files - Array of file operations
- * @param {string} [ref] - The name of the branch, tag or commit
- * @returns {Promise<GitLabTree>} The created tree
- */
-async function createTree(
-  projectId: string,
-  files: FileOperation[],
-  ref?: string
-): Promise<GitLabTree> {
-  projectId = decodeURIComponent(projectId); // Decode project ID
-  const url = new URL(
-    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/repository/tree`
-  );
-
-  if (ref) {
-    url.searchParams.append("ref", ref);
-  }
-
-  const response = await fetch(url.toString(), {
-    ...getFetchConfig(),
-    method: "POST",
-    body: JSON.stringify({
-      files: files.map(file => ({
-        file_path: file.path,
-        content: file.content,
-        encoding: "text",
-      })),
-    }),
-  });
-
-  if (response.status === 400) {
-    const errorBody = await response.text();
-    throw new Error(`Invalid request: ${errorBody}`);
-  }
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`GitLab API error: ${response.status} ${response.statusText}\n${errorBody}`);
-  }
-
-  const data = await response.json();
-  return GitLabTreeSchema.parse(data);
-}
-
-/**
  * Create a commit in a GitLab project repository
  * 저장소에 커밋 생성
  *
@@ -2587,8 +4033,8 @@ async function createCommit(
       actions: actions.map(action => ({
         action: "create",
         file_path: action.path,
-        content: action.content,
-        encoding: "text",
+        content: encodeRepoFilePayloadContent(action.content),
+        encoding: GITLAB_REPO_FILE_ENCODING,
       })),
     }),
   });
@@ -2653,6 +4099,67 @@ async function searchProjects(
 }
 
 /**
+ * Search for code blobs using GitLab Search API
+ * Supports global, project-level, and group-level search
+ */
+async function searchBlobs(params: {
+  search: string;
+  project_id?: string;
+  group_id?: string;
+  ref?: string;
+  filename?: string;
+  path?: string;
+  extension?: string;
+  page?: number;
+  per_page?: number;
+}): Promise<GitLabSearchBlobResult[]> {
+  let basePath: string;
+  if (params.project_id) {
+    const decodedProjectId = decodeURIComponent(params.project_id);
+    const projectId = encodeURIComponent(getEffectiveProjectId(decodedProjectId));
+    basePath = `${getEffectiveApiUrl()}/projects/${projectId}/search`;
+  } else if (params.group_id) {
+    const groupId = encodeURIComponent(decodeURIComponent(params.group_id));
+    basePath = `${getEffectiveApiUrl()}/groups/${groupId}/search`;
+  } else {
+    basePath = `${getEffectiveApiUrl()}/search`;
+  }
+
+  const url = new URL(basePath);
+  url.searchParams.append("scope", "blobs");
+  url.searchParams.append("search", params.search);
+
+  if (params.ref) {
+    url.searchParams.append("ref", params.ref);
+  }
+  if (params.page) {
+    url.searchParams.append("page", params.page.toString());
+  }
+  if (params.per_page) {
+    url.searchParams.append("per_page", params.per_page.toString());
+  }
+
+  if (params.filename) {
+    url.searchParams.append("filename", params.filename);
+  }
+  if (params.path) {
+    url.searchParams.append("path", params.path);
+  }
+  if (params.extension) {
+    url.searchParams.append("extension", params.extension);
+  }
+
+  const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
+  });
+
+  await handleGitLabError(response);
+
+  const data = await response.json();
+  return z.array(GitLabSearchBlobResultSchema).parse(data);
+}
+
+/**
  * Create a new GitLab repository
  * 새 저장소 생성
  *
@@ -2707,6 +4214,7 @@ async function getMergeRequest(
         getEffectiveProjectId(projectId)
       )}/merge_requests/${mergeRequestIid}`
     );
+    url.searchParams.append("include_diverged_commits_count", "true");
   } else if (branchName) {
     url = new URL(
       `${getEffectiveApiUrl()}/projects/${encodeURIComponent(
@@ -2727,10 +4235,254 @@ async function getMergeRequest(
 
   // If response is an array (Comes from branchName search), return the first item if exist
   if (Array.isArray(data) && data.length > 0) {
-    return GitLabMergeRequestSchema.parse(data[0]);
+    const mergeRequest = GitLabMergeRequestSchema.parse(data[0]);
+    return getMergeRequest(projectId, mergeRequest.iid, undefined);
   }
 
   return GitLabMergeRequestSchema.parse(data);
+}
+
+async function getMergeRequestSourceCommitCount(
+  projectId: string,
+  mergeRequestIid: string
+): Promise<number> {
+  const url = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(
+      getEffectiveProjectId(projectId)
+    )}/merge_requests/${mergeRequestIid}/commits`
+  );
+  url.searchParams.append("per_page", "100");
+
+  let totalCount = 0;
+  let page = 1;
+
+  while (true) {
+    url.searchParams.set("page", String(page));
+    const response = await fetch(url.toString(), {
+      ...getFetchConfig(),
+    });
+    await handleGitLabError(response);
+
+    const data = await response.json();
+    if (!Array.isArray(data)) {
+      throw new Error("Unexpected merge request commits response format");
+    }
+
+    totalCount += data.length;
+
+    const nextPage = response.headers.get("x-next-page");
+    if (!nextPage) {
+      break;
+    }
+
+    page = Number.parseInt(nextPage, 10);
+    if (Number.isNaN(page) || page <= 0) {
+      break;
+    }
+  }
+
+  return totalCount;
+}
+
+async function getProjectMergeMethod(projectId: string): Promise<string | null> {
+  const url = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}`
+  );
+  const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
+  });
+  await handleGitLabError(response);
+
+  const data: unknown = await response.json();
+  const mergeMethod = z
+    .object({
+      merge_method: z.string().nullable().optional(),
+    })
+    .parse(data).merge_method;
+
+  return typeof mergeMethod === "string" ? mergeMethod : null;
+}
+
+
+
+async function buildMergeRequestCommitAdditionSummary(
+  projectId: string,
+  mergeRequest: GitLabMergeRequest
+): Promise<GitLabMergeRequestWithDeploymentSummary["commit_addition_summary"]> {
+  try {
+    const sourceCommitCount = await getMergeRequestSourceCommitCount(projectId, mergeRequest.iid);
+    const mergeMethod = await getProjectMergeMethod(projectId);
+    const mergeCommitCount = estimateMergeCommitCount(mergeMethod, sourceCommitCount);
+
+    const summary =
+      mergeCommitCount === null
+        ? null
+        : `${sourceCommitCount} commits and ${mergeCommitCount} merge commit${mergeCommitCount === 1 ? "" : "s"} will be added to ${mergeRequest.target_branch}.`;
+
+    return {
+      target_branch: mergeRequest.target_branch,
+      source_commits_count: sourceCommitCount,
+      merge_method: mergeMethod,
+      merge_commit_count: mergeCommitCount,
+      summary,
+    };
+  } catch (error) {
+    const unavailableReason = error instanceof Error ? error.message : String(error);
+    return {
+      target_branch: mergeRequest.target_branch,
+      source_commits_count: null,
+      merge_method: null,
+      merge_commit_count: null,
+      summary: null,
+      unavailable_reason: unavailableReason,
+    };
+  }
+}
+
+async function buildMergeRequestApprovalSummary(
+  projectId: string,
+  mergeRequestIid: string
+): Promise<GitLabMergeRequestWithDeploymentSummary["approval_summary"]> {
+  try {
+    const approvalState = await getMergeRequestApprovalState(projectId, mergeRequestIid);
+    const approvedByUsers = approvalState.approved_by || [];
+    const approvedByUsernames =
+      approvalState.approved_by_usernames || approvedByUsers.map(user => user.username);
+    const inferredApproved = inferMergeRequestApproved(approvalState.rules);
+
+    return {
+      approved: approvalState.approved ?? inferredApproved,
+      user_has_approved: approvalState.user_has_approved ?? null,
+      user_can_approve: approvalState.user_can_approve ?? null,
+      approved_by: approvedByUsers,
+      approved_by_usernames: approvedByUsernames,
+      rules_count: approvalState.rules?.length ?? null,
+      source_endpoint: approvalState.source_endpoint ?? null,
+    };
+  } catch (error) {
+    const unavailableReason = error instanceof Error ? error.message : String(error);
+    return {
+      approved: null,
+      user_has_approved: null,
+      user_can_approve: null,
+      approved_by: [],
+      approved_by_usernames: [],
+      rules_count: null,
+      source_endpoint: null,
+      unavailable_reason: unavailableReason,
+    };
+  }
+}
+
+function toMergeRequestDeploymentSummaryRecord(
+  deployment: GitLabDeployment
+): GitLabMergeRequestDeploymentSummaryRecord {
+  return {
+    id: deployment.id,
+    status: deployment.status,
+    ref: deployment.ref,
+    sha: deployment.sha,
+    created_at: deployment.created_at,
+    updated_at: deployment.updated_at,
+    finished_at: deployment.finished_at,
+    web_url: deployment.web_url,
+    environment: deployment.environment
+      ? {
+          id: deployment.environment.id,
+          name: deployment.environment.name,
+          slug: deployment.environment.slug,
+          external_url: deployment.environment.external_url,
+          state: deployment.environment.state,
+          tier: deployment.environment.tier,
+        }
+      : undefined,
+    deployable:
+      deployment.deployable === null
+        ? null
+        : deployment.deployable
+          ? {
+              id: deployment.deployable.id,
+              name: deployment.deployable.name,
+              status: deployment.deployable.status,
+              stage: deployment.deployable.stage,
+              web_url: deployment.deployable.web_url,
+              pipeline: deployment.deployable.pipeline
+                ? {
+                    id: deployment.deployable.pipeline.id,
+                    status: deployment.deployable.pipeline.status,
+                    ref: deployment.deployable.pipeline.ref,
+                    sha: deployment.deployable.pipeline.sha,
+                    web_url: deployment.deployable.pipeline.web_url,
+                  }
+                : undefined,
+            }
+          : undefined,
+  };
+}
+
+function sortDeploymentsByCreatedAtDesc(deployments: GitLabDeployment[]): GitLabDeployment[] {
+  return [...deployments].sort((a, b) => {
+    const aTime = Date.parse(a.created_at);
+    const bTime = Date.parse(b.created_at);
+
+    if (Number.isNaN(aTime) || Number.isNaN(bTime)) {
+      return b.created_at.localeCompare(a.created_at);
+    }
+
+    return bTime - aTime;
+  });
+}
+
+async function buildMergeRequestDeploymentSummary(
+  projectId: string,
+  mergeRequest: GitLabMergeRequest
+): Promise<GitLabMergeRequestWithDeploymentSummary["deployment_summary"]> {
+  const lookupSha = mergeRequest.merge_commit_sha ?? mergeRequest.diff_refs?.head_sha ?? null;
+
+  if (!lookupSha) {
+    return {
+      lookup_sha: null,
+      sort: "created_at_desc",
+      limit: MERGE_REQUEST_DEPLOYMENT_SUMMARY_LIMIT,
+      total_count: 0,
+      returned_count: 0,
+      records: [],
+    };
+  }
+
+  try {
+    const deployments = await listDeployments(projectId, {
+      sha: lookupSha,
+      order_by: "created_at",
+      sort: "desc",
+      per_page: 100,
+    });
+    const sortedDeployments = sortDeploymentsByCreatedAtDesc(deployments);
+    const records = sortedDeployments
+      .slice(0, MERGE_REQUEST_DEPLOYMENT_SUMMARY_LIMIT)
+      .map(toMergeRequestDeploymentSummaryRecord);
+
+    return {
+      lookup_sha: lookupSha,
+      sort: "created_at_desc",
+      limit: MERGE_REQUEST_DEPLOYMENT_SUMMARY_LIMIT,
+      total_count: sortedDeployments.length,
+      returned_count: records.length,
+      records,
+    };
+  } catch (error) {
+    const unavailableReason = error instanceof Error ? error.message : String(error);
+
+    return {
+      lookup_sha: lookupSha,
+      sort: "created_at_desc",
+      limit: MERGE_REQUEST_DEPLOYMENT_SUMMARY_LIMIT,
+      total_count: 0,
+      returned_count: 0,
+      records: [],
+      unavailable_reason: unavailableReason,
+    };
+  }
 }
 
 /**
@@ -2830,6 +4582,135 @@ async function listMergeRequestDiffs(
 
   await handleGitLabError(response);
   return await response.json(); // Return full response including commits, diff_refs, changes, etc.
+}
+
+/**
+ * Returns the list of changed files in a merge request WITHOUT diff content.
+ * Use this as STEP 1 of code review: get file paths, then fetch diffs in batches
+ * with getMergeRequestFileDiff to avoid loading the entire diff payload at once.
+ *
+ * @param {string} projectId - The ID or URL-encoded path of the project
+ * @param {number|string} [mergeRequestIid] - The internal ID of the merge request
+ * @param {string} [branchName] - The name of the source branch (used to resolve MR if iid not provided)
+ * @param {string[]} [excludedFilePatterns] - Regex patterns to exclude files from the result
+ * @returns {Promise<any[]>} Array of changed file metadata (new_path, old_path, new_file, deleted_file, renamed_file)
+ */
+async function listMergeRequestChangedFiles(
+  projectId: string,
+  mergeRequestIid?: number | string,
+  branchName?: string,
+  excludedFilePatterns?: string[]
+): Promise<any[]> {
+  projectId = decodeURIComponent(projectId);
+  if (!mergeRequestIid && !branchName) {
+    throw new Error("Either mergeRequestIid or branchName must be provided");
+  }
+
+  if (branchName && !mergeRequestIid) {
+    const mergeRequest = await getMergeRequest(projectId, undefined, branchName);
+    mergeRequestIid = mergeRequest.iid;
+  }
+
+  const url = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(
+      getEffectiveProjectId(projectId)
+    )}/merge_requests/${mergeRequestIid}/changes`
+  );
+
+  const response = await fetch(url.toString(), { ...getFetchConfig() });
+  await handleGitLabError(response);
+  const data = (await response.json()) as { changes: any[] };
+
+  const rawFiles = (data.changes || []).map((f: any) => ({
+    new_path: f.new_path,
+    old_path: f.old_path,
+    new_file: f.new_file,
+    deleted_file: f.deleted_file,
+    renamed_file: f.renamed_file,
+  }));
+
+  return filterDiffsByPatterns(rawFiles, excludedFilePatterns);
+}
+
+/**
+ * Get diffs for specific files from a merge request.
+ * Use this as STEP 2 of code review: pass file paths obtained from
+ * listMergeRequestChangedFiles to fetch their diffs efficiently.
+ *
+ * @param {string} projectId - The ID or URL-encoded path of the project
+ * @param {string[]} filePaths - List of file paths to retrieve diffs for
+ * @param {number|string} [mergeRequestIid] - The internal ID of the merge request
+ * @param {string} [branchName] - The name of the source branch (used to resolve MR if iid not provided)
+ * @param {boolean} [unidiff] - Return diff in unified diff format
+ * @returns {Promise<any[]>} Array of diff objects for each requested file, or error objects for files not found
+ */
+async function getMergeRequestFileDiff(
+  projectId: string,
+  filePaths: string[],
+  mergeRequestIid?: number | string,
+  branchName?: string,
+  unidiff?: boolean
+): Promise<any[]> {
+  projectId = decodeURIComponent(projectId);
+  if (!mergeRequestIid && !branchName) {
+    throw new Error("Either mergeRequestIid or branchName must be provided");
+  }
+
+  if (branchName && !mergeRequestIid) {
+    const mergeRequest = await getMergeRequest(projectId, undefined, branchName);
+    mergeRequestIid = mergeRequest.iid;
+  }
+
+  // Paginate through /diffs once, collecting all requested files.
+  // More efficient than N separate searches when fetching multiple files.
+  const remaining = new Set(filePaths);
+  const results: any[] = [];
+  let page = 1;
+  const perPage = 20;
+
+  while (remaining.size > 0) {
+    const url = new URL(
+      `${getEffectiveApiUrl()}/projects/${encodeURIComponent(
+        getEffectiveProjectId(projectId)
+      )}/merge_requests/${mergeRequestIid}/diffs`
+    );
+    url.searchParams.append("page", page.toString());
+    url.searchParams.append("per_page", perPage.toString());
+    if (unidiff) {
+      url.searchParams.append("unidiff", "true");
+    }
+
+    const response = await fetch(url.toString(), { ...getFetchConfig() });
+    await handleGitLabError(response);
+    const items = (await response.json()) as any[];
+
+    if (!Array.isArray(items) || items.length === 0) {
+      break;
+    }
+
+    for (const item of items) {
+      if (remaining.has(item.new_path) || remaining.has(item.old_path)) {
+        results.push(item);
+        remaining.delete(item.new_path);
+        remaining.delete(item.old_path);
+      }
+    }
+
+    if (items.length < perPage) {
+      break;
+    }
+
+    page++;
+  }
+
+  for (const notFound of remaining) {
+    results.push({
+      error: `File not found in merge request diffs: ${notFound}`,
+      hint: "Use list_merge_request_changed_files to verify the correct file paths.",
+    });
+  }
+
+  return results;
 }
 
 /**
@@ -2980,7 +4861,7 @@ async function approveMergeRequest(
   });
 
   await handleGitLabError(response);
-  return GitLabMergeRequestApprovalStateSchema.parse(await response.json());
+  return parseApprovalsResponse(await response.json());
 }
 
 /**
@@ -3006,7 +4887,7 @@ async function unapproveMergeRequest(
   });
 
   await handleGitLabError(response);
-  return GitLabMergeRequestApprovalStateSchema.parse(await response.json());
+  return parseApprovalsResponse(await response.json());
 }
 
 /**
@@ -3021,8 +4902,51 @@ async function getMergeRequestApprovalState(
   mergeRequestIid: string | number
 ): Promise<GitLabMergeRequestApprovalState> {
   projectId = decodeURIComponent(projectId);
-  const url = new URL(
+  const approvalStateUrl = new URL(
     `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/merge_requests/${mergeRequestIid}/approval_state`
+  );
+
+  const approvalStateResponse = await fetch(approvalStateUrl.toString(), {
+    ...getFetchConfig(),
+    method: "GET",
+  });
+
+  if (approvalStateResponse.status === 404) {
+    return getMergeRequestApprovalsFallback(projectId, mergeRequestIid);
+  }
+
+  await handleGitLabError(approvalStateResponse);
+
+  const parsedApprovalState = GitLabMergeRequestApprovalStateSchema.parse(
+    await approvalStateResponse.json()
+  );
+  const approvedByUsers = getUniqueApprovalUsers(
+    (parsedApprovalState.rules || []).flatMap(rule => rule.approved_by || [])
+  );
+  const approvedByUsernames = approvedByUsers.map(user => user.username);
+
+  return {
+    ...parsedApprovalState,
+    approved_by: approvedByUsers,
+    approved_by_usernames: approvedByUsernames,
+    source_endpoint: "approval_state",
+  };
+}
+
+/**
+ * Get the conflicts of a merge request
+ *
+ * @param {string} projectId - The ID or URL-encoded path of the project
+ * @param {string | number} mergeRequestIid - The internal ID of the merge request
+ * @returns {Promise<Record<string, unknown>>} The merge request conflicts
+ */
+async function getMergeRequestConflicts(
+  projectId: string,
+  mergeRequestIid: string | number
+): Promise<Record<string, unknown>> {
+  projectId = decodeURIComponent(projectId);
+  const url = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/merge_requests/${mergeRequestIid}/conflicts`
   );
 
   const response = await fetch(url.toString(), {
@@ -3031,7 +4955,74 @@ async function getMergeRequestApprovalState(
   });
 
   await handleGitLabError(response);
-  return GitLabMergeRequestApprovalStateSchema.parse(await response.json());
+
+  return (await response.json()) as Record<string, unknown>;
+}
+
+async function getMergeRequestApprovalsFallback(
+  projectId: string,
+  mergeRequestIid: string | number
+): Promise<GitLabMergeRequestApprovalState> {
+  const approvalsUrl = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/merge_requests/${mergeRequestIid}/approvals`
+  );
+
+  const approvalsResponse = await fetch(approvalsUrl.toString(), {
+    ...getFetchConfig(),
+    method: "GET",
+  });
+
+  await handleGitLabError(approvalsResponse);
+  return parseApprovalsResponse(await approvalsResponse.json());
+}
+
+/**
+ * Parse the response from POST /approve and POST /unapprove endpoints.
+ * These endpoints return the approvals format (approved_by contains nested
+ * { user: {...} } objects), which must be converted to the flat format
+ * used by GitLabMergeRequestApprovalStateSchema.
+ */
+function parseApprovalsResponse(responseJson: unknown): GitLabMergeRequestApprovalState {
+  const parsedApprovals = GitLabMergeRequestApprovalsResponseSchema.parse(responseJson);
+  const approvedByUsers = getUniqueApprovalUsers(
+    (parsedApprovals.approved_by || []).map(approvedByEntry => approvedByEntry.user)
+  );
+  const approvedByUsernames = approvedByUsers.map(user => user.username);
+
+  return GitLabMergeRequestApprovalStateSchema.parse({
+    approved: parsedApprovals.approved,
+    user_has_approved: parsedApprovals.user_has_approved,
+    user_can_approve: parsedApprovals.user_can_approve,
+    approved_by: approvedByUsers,
+    approved_by_usernames: approvedByUsernames,
+    source_endpoint: "approvals",
+  });
+}
+
+function getUniqueApprovalUsers(users: GitLabApprovalUser[]): GitLabApprovalUser[] {
+  const uniqueUsers = new Map<string, GitLabApprovalUser>();
+
+  for (const user of users) {
+    if (!uniqueUsers.has(user.id)) {
+      uniqueUsers.set(user.id, user);
+    }
+  }
+
+  return [...uniqueUsers.values()];
+}
+
+function inferMergeRequestApproved(
+  rules: GitLabMergeRequestApprovalState["rules"]
+): boolean | null {
+  if (!rules || rules.length === 0) {
+    return null;
+  }
+
+  if (rules.some(rule => typeof rule.approved !== "boolean")) {
+    return null;
+  }
+
+  return rules.every(rule => rule.approved === true);
 }
 
 /**
@@ -3047,12 +5038,12 @@ async function getMergeRequestApprovalState(
  */
 async function createNote(
   projectId: string,
-  noteableType: "issue" | "merge_request", // 'issue' 또는 'merge_request' 타입 명시
+  noteableType: "issue" | "merge_request", // specifies 'issue' or 'merge_request' type
   noteableIid: number | string,
   body: string
 ): Promise<any> {
   projectId = decodeURIComponent(projectId); // Decode project ID
-  // ⚙️ 응답 타입은 GitLab API 문서에 따라 조정 가능
+  // ⚙️ Response type can be adjusted according to the GitLab API documentation
   const url = new URL(
     `${getEffectiveApiUrl()}/projects/${encodeURIComponent(
       getEffectiveProjectId(projectId)
@@ -3085,7 +5076,8 @@ async function getDraftNote(
   draft_note_id: string
 ): Promise<GitLabDraftNote> {
   const response = await fetch(
-    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(project_id)}/merge_requests/${merge_request_iid}/draft_notes/${draft_note_id}`
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(project_id)}/merge_requests/${merge_request_iid}/draft_notes/${draft_note_id}`,
+    { ...getFetchConfig() }
   );
 
   if (!response.ok) {
@@ -3127,6 +5119,7 @@ async function listDraftNotes(
  * @param {string} projectId - The ID or URL-encoded path of the project
  * @param {number|string} mergeRequestIid - The internal ID of the merge request
  * @param {string} body - The content of the draft note
+ * @param {string} [inReplyToDiscussionId] - The ID of a discussion the draft note replies to
  * @param {MergeRequestThreadPosition} [position] - Position information for diff notes
  * @param {boolean} [resolveDiscussion] - Whether to resolve the discussion when publishing
  * @returns {Promise<GitLabDraftNote>} The created draft note
@@ -3135,6 +5128,7 @@ async function createDraftNote(
   projectId: string,
   mergeRequestIid: number | string,
   body: string,
+  inReplyToDiscussionId?: string,
   position?: MergeRequestThreadPosition,
   resolveDiscussion?: boolean
 ): Promise<GitLabDraftNote> {
@@ -3146,6 +5140,9 @@ async function createDraftNote(
   );
 
   const requestBody: any = { note: body };
+  if (inReplyToDiscussionId) {
+    requestBody.in_reply_to_discussion_id = inReplyToDiscussionId;
+  }
   if (position) {
     requestBody.position = position;
   }
@@ -3504,137 +5501,6 @@ async function getMergeRequestVersion(
 }
 
 /**
- * List all namespaces
- * 사용 가능한 모든 네임스페이스 목록 조회
- *
- * @param {Object} options - Options for listing namespaces
- * @param {string} [options.search] - Search query to filter namespaces
- * @param {boolean} [options.owned_only] - Only return namespaces owned by the authenticated user
- * @param {boolean} [options.top_level_only] - Only return top-level namespaces
- * @returns {Promise<GitLabNamespace[]>} List of namespaces
- */
-async function listNamespaces(options: {
-  search?: string;
-  owned_only?: boolean;
-  top_level_only?: boolean;
-}): Promise<GitLabNamespace[]> {
-  const url = new URL(`${getEffectiveApiUrl()}/namespaces`);
-
-  if (options.search) {
-    url.searchParams.append("search", options.search);
-  }
-
-  if (options.owned_only) {
-    url.searchParams.append("owned_only", "true");
-  }
-
-  if (options.top_level_only) {
-    url.searchParams.append("top_level_only", "true");
-  }
-
-  const response = await fetch(url.toString(), {
-    ...getFetchConfig(),
-  });
-
-  await handleGitLabError(response);
-  const data = await response.json();
-  return z.array(GitLabNamespaceSchema).parse(data);
-}
-
-/**
- * Get details on a namespace
- * 네임스페이스 상세 정보 조회
- *
- * @param {string} id - The ID or URL-encoded path of the namespace
- * @returns {Promise<GitLabNamespace>} The namespace details
- */
-async function getNamespace(id: string): Promise<GitLabNamespace> {
-  const url = new URL(`${getEffectiveApiUrl()}/namespaces/${encodeURIComponent(id)}`);
-
-  const response = await fetch(url.toString(), {
-    ...getFetchConfig(),
-  });
-
-  await handleGitLabError(response);
-  const data = await response.json();
-  return GitLabNamespaceSchema.parse(data);
-}
-
-/**
- * Verify if a namespace exists
- * 네임스페이스 존재 여부 확인
- *
- * @param {string} namespacePath - The path of the namespace to check
- * @param {number} [parentId] - The ID of the parent namespace
- * @returns {Promise<GitLabNamespaceExistsResponse>} The verification result
- */
-async function verifyNamespaceExistence(
-  namespacePath: string,
-  parentId?: number
-): Promise<GitLabNamespaceExistsResponse> {
-  const url = new URL(
-    `${getEffectiveApiUrl()}/namespaces/${encodeURIComponent(namespacePath)}/exists`
-  );
-
-  if (parentId) {
-    url.searchParams.append("parent_id", parentId.toString());
-  }
-
-  const response = await fetch(url.toString(), {
-    ...getFetchConfig(),
-  });
-
-  await handleGitLabError(response);
-  const data = await response.json();
-  return GitLabNamespaceExistsResponseSchema.parse(data);
-}
-
-/**
- * Get a single project
- * 단일 프로젝트 조회
- *
- * @param {string} projectId - The ID or URL-encoded path of the project
- * @param {Object} options - Options for getting project details
- * @param {boolean} [options.license] - Include project license data
- * @param {boolean} [options.statistics] - Include project statistics
- * @param {boolean} [options.with_custom_attributes] - Include custom attributes in response
- * @returns {Promise<GitLabProject>} Project details
- */
-async function getProject(
-  projectId: string,
-  options: {
-    license?: boolean;
-    statistics?: boolean;
-    with_custom_attributes?: boolean;
-  } = {}
-): Promise<GitLabProject> {
-  projectId = decodeURIComponent(projectId); // Decode project ID
-  const url = new URL(
-    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}`
-  );
-
-  if (options.license) {
-    url.searchParams.append("license", "true");
-  }
-
-  if (options.statistics) {
-    url.searchParams.append("statistics", "true");
-  }
-
-  if (options.with_custom_attributes) {
-    url.searchParams.append("with_custom_attributes", "true");
-  }
-
-  const response = await fetch(url.toString(), {
-    ...getFetchConfig(),
-  });
-
-  await handleGitLabError(response);
-  const data = await response.json();
-  return GitLabRepositorySchema.parse(data);
-}
-
-/**
  * List projects
  * 프로젝트 목록 조회
  *
@@ -3886,6 +5752,102 @@ async function listGroupProjects(
   return GitLabProjectSchema.array().parse(projects);
 }
 
+// Webhook API helper functions
+
+/**
+ * Build the base URL for webhooks (project or group)
+ */
+function buildWebhookBaseUrl(projectId?: string, groupId?: string): string {
+  if (projectId) {
+    projectId = decodeURIComponent(projectId);
+    return `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/hooks`;
+  }
+  const decodedGroupId = decodeURIComponent(groupId!);
+  return `${getEffectiveApiUrl()}/groups/${encodeURIComponent(decodedGroupId)}/hooks`;
+}
+
+/**
+ * List webhooks for a project or group
+ */
+async function listWebhooks(
+  options: z.infer<typeof ListWebhooksSchema>
+): Promise<unknown[]> {
+  const url = new URL(buildWebhookBaseUrl(options.project_id, options.group_id));
+
+  if (options.page) url.searchParams.append("page", options.page.toString());
+  if (options.per_page) url.searchParams.append("per_page", options.per_page.toString());
+
+  const response = await fetch(url.toString(), { ...getFetchConfig() });
+  await handleGitLabError(response);
+  return (await response.json()) as unknown[];
+}
+
+
+
+/**
+ * Fetch a single page of webhook events
+ */
+async function fetchWebhookEventsPage(
+  baseUrl: string,
+  page: number,
+  perPage: number,
+  status?: string | number
+): Promise<Record<string, unknown>[]> {
+  const url = new URL(baseUrl);
+  url.searchParams.set("page", page.toString());
+  url.searchParams.set("per_page", perPage.toString());
+  if (status !== undefined) url.searchParams.append("status", String(status));
+
+  const response = await fetch(url.toString(), { ...getFetchConfig() });
+  await handleGitLabError(response);
+  return (await response.json()) as Record<string, unknown>[];
+}
+
+/**
+ * List webhook events for a project or group webhook
+ */
+async function listWebhookEvents(
+  options: z.infer<typeof ListWebhookEventsSchema>
+): Promise<unknown[]> {
+  const eventsUrl = `${buildWebhookBaseUrl(options.project_id, options.group_id)}/${options.hook_id}/events`;
+
+  const events = await fetchWebhookEventsPage(
+    eventsUrl,
+    options.page ?? 1,
+    options.per_page ?? 20,
+    options.status
+  );
+  return options.summary ? summarizeWebhookEvents(events) : events;
+}
+
+/**
+ * Get a specific webhook event by ID (searches up to 500 recent events)
+ */
+async function getWebhookEvent(
+  options: z.infer<typeof GetWebhookEventSchema>
+): Promise<Record<string, unknown> | null> {
+  const eventsUrl = `${buildWebhookBaseUrl(options.project_id, options.group_id)}/${options.hook_id}/events`;
+  // GitLab enforces max per_page=20 for webhook events
+  const perPage = 20;
+
+  if (options.page) {
+    // Direct page lookup — single API call
+    const events = await fetchWebhookEventsPage(eventsUrl, options.page, perPage);
+    const match = events.find(e => e.id === options.event_id);
+    return match ?? null;
+  }
+
+  // Auto-paginate up to 500 events
+  const maxPages = 25;
+  for (let page = 1; page <= maxPages; page++) {
+    const events = await fetchWebhookEventsPage(eventsUrl, page, perPage);
+    const match = events.find(e => e.id === options.event_id);
+    if (match) return match;
+    if (events.length < perPage) break;
+  }
+  return null;
+}
+
 // Wiki API helper functions
 /**
  * List wiki pages in a project
@@ -3993,6 +5955,111 @@ async function deleteWikiPage(projectId: string, slug: string): Promise<void> {
 }
 
 /**
+ * List wiki pages in a GitLab group
+ */
+async function listGroupWikiPages(
+  groupId: string,
+  options: Omit<ListGroupWikiPagesOptions, "group_id"> = {}
+): Promise<GitLabWikiPage[]> {
+  groupId = decodeURIComponent(groupId); // Decode group ID
+  const url = new URL(
+    `${getEffectiveApiUrl()}/groups/${encodeURIComponent(groupId)}/wikis`
+  );
+  if (options.page) url.searchParams.append("page", options.page.toString());
+  if (options.per_page) url.searchParams.append("per_page", options.per_page.toString());
+  if (options.with_content)
+    url.searchParams.append("with_content", options.with_content.toString());
+  const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
+  });
+  await handleGitLabError(response);
+  const data = await response.json();
+  return GitLabWikiPageSchema.array().parse(data);
+}
+
+/**
+ * Get a specific group wiki page
+ */
+async function getGroupWikiPage(groupId: string, slug: string): Promise<GitLabWikiPage> {
+  groupId = decodeURIComponent(groupId); // Decode group ID
+  const response = await fetch(
+    `${getEffectiveApiUrl()}/groups/${encodeURIComponent(groupId)}/wikis/${encodeURIComponent(slug)}`,
+    { ...getFetchConfig() }
+  );
+  await handleGitLabError(response);
+  const data = await response.json();
+  return GitLabWikiPageSchema.parse(data);
+}
+
+/**
+ * Create a new group wiki page
+ */
+async function createGroupWikiPage(
+  groupId: string,
+  title: string,
+  content: string,
+  format?: string
+): Promise<GitLabWikiPage> {
+  groupId = decodeURIComponent(groupId); // Decode group ID
+  const body: Record<string, any> = { title, content };
+  if (format) body.format = format;
+  const response = await fetch(
+    `${getEffectiveApiUrl()}/groups/${encodeURIComponent(groupId)}/wikis`,
+    {
+      ...getFetchConfig(),
+      method: "POST",
+      body: JSON.stringify(body),
+    }
+  );
+  await handleGitLabError(response);
+  const data = await response.json();
+  return GitLabWikiPageSchema.parse(data);
+}
+
+/**
+ * Update an existing group wiki page
+ */
+async function updateGroupWikiPage(
+  groupId: string,
+  slug: string,
+  title?: string,
+  content?: string,
+  format?: string
+): Promise<GitLabWikiPage> {
+  groupId = decodeURIComponent(groupId); // Decode group ID
+  const body: Record<string, any> = {};
+  if (title) body.title = title;
+  if (content) body.content = content;
+  if (format) body.format = format;
+  const response = await fetch(
+    `${getEffectiveApiUrl()}/groups/${encodeURIComponent(groupId)}/wikis/${encodeURIComponent(slug)}`,
+    {
+      ...getFetchConfig(),
+      method: "PUT",
+      body: JSON.stringify(body),
+    }
+  );
+  await handleGitLabError(response);
+  const data = await response.json();
+  return GitLabWikiPageSchema.parse(data);
+}
+
+/**
+ * Delete a group wiki page
+ */
+async function deleteGroupWikiPage(groupId: string, slug: string): Promise<void> {
+  groupId = decodeURIComponent(groupId); // Decode group ID
+  const response = await fetch(
+    `${getEffectiveApiUrl()}/groups/${encodeURIComponent(groupId)}/wikis/${encodeURIComponent(slug)}`,
+    {
+      ...getFetchConfig(),
+      method: "DELETE",
+    }
+  );
+  await handleGitLabError(response);
+}
+
+/**
  * List pipelines in a GitLab project
  *
  * @param {string} projectId - The ID or URL-encoded path of the project
@@ -4051,6 +6118,126 @@ async function getPipeline(
   await handleGitLabError(response);
   const data = await response.json();
   return GitLabPipelineSchema.parse(data);
+}
+
+/**
+ * List deployments in a GitLab project
+ *
+ * @param {string} projectId - The ID or URL-encoded path of the project
+ * @param {ListDeploymentsOptions} options - Options for filtering deployments
+ * @returns {Promise<GitLabDeployment[]>} List of deployments
+ */
+async function listDeployments(
+  projectId: string,
+  options: Omit<ListDeploymentsOptions, "project_id"> = {}
+): Promise<GitLabDeployment[]> {
+  projectId = decodeURIComponent(projectId);
+  const url = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/deployments`
+  );
+
+  Object.entries(options).forEach(([key, value]) => {
+    if (value !== undefined) {
+      url.searchParams.append(key, value.toString());
+    }
+  });
+
+  const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
+  });
+
+  await handleGitLabError(response);
+  const data = await response.json();
+  return z.array(GitLabDeploymentSchema).parse(data);
+}
+
+/**
+ * Get details of a specific deployment
+ *
+ * @param {string} projectId - The ID or URL-encoded path of the project
+ * @param {number | string} deploymentId - The ID of the deployment
+ * @returns {Promise<GitLabDeployment>} Deployment details
+ */
+async function getDeployment(
+  projectId: string,
+  deploymentId: number | string
+): Promise<GitLabDeployment> {
+  projectId = decodeURIComponent(projectId);
+  const url = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/deployments/${deploymentId}`
+  );
+
+  const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
+  });
+
+  if (response.status === 404) {
+    throw new Error(`Deployment not found`);
+  }
+
+  await handleGitLabError(response);
+  const data = await response.json();
+  return GitLabDeploymentSchema.parse(data);
+}
+
+/**
+ * List environments in a GitLab project
+ *
+ * @param {string} projectId - The ID or URL-encoded path of the project
+ * @param {ListEnvironmentsOptions} options - Options for filtering environments
+ * @returns {Promise<GitLabEnvironment[]>} List of environments
+ */
+async function listEnvironments(
+  projectId: string,
+  options: Omit<ListEnvironmentsOptions, "project_id"> = {}
+): Promise<GitLabEnvironment[]> {
+  projectId = decodeURIComponent(projectId);
+  const url = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/environments`
+  );
+
+  Object.entries(options).forEach(([key, value]) => {
+    if (value !== undefined) {
+      url.searchParams.append(key, value.toString());
+    }
+  });
+
+  const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
+  });
+
+  await handleGitLabError(response);
+  const data = await response.json();
+  return z.array(GitLabEnvironmentSchema).parse(data);
+}
+
+/**
+ * Get details of a specific environment
+ *
+ * @param {string} projectId - The ID or URL-encoded path of the project
+ * @param {number | string} environmentId - The ID of the environment
+ * @returns {Promise<GitLabEnvironment>} Environment details
+ */
+async function getEnvironment(
+  projectId: string,
+  environmentId: number | string
+): Promise<GitLabEnvironment> {
+  projectId = decodeURIComponent(projectId);
+  const url = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/environments/${environmentId}`
+  );
+
+  const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
+  });
+
+  if (response.status === 404) {
+    throw new Error(`Environment not found`);
+  }
+
+  await handleGitLabError(response);
+  const data = await response.json();
+  return GitLabEnvironmentSchema.parse(data);
 }
 
 /**
@@ -4225,17 +6412,137 @@ async function getPipelineJobOutput(
 }
 
 /**
+ * List artifact files in a job's artifacts archive
+ *
+ * @param {string} projectId - The ID or URL-encoded path of the project
+ * @param {string} jobId - The ID of the job
+ * @param {Object} options - Options for listing artifacts
+ * @returns {Promise<GitLabArtifactEntry[]>} List of artifact entries
+ */
+async function listJobArtifacts(
+  projectId: string,
+  jobId: string,
+  options: Omit<z.infer<typeof ListJobArtifactsSchema>, "project_id" | "job_id"> = {}
+): Promise<GitLabArtifactEntry[]> {
+  projectId = decodeURIComponent(projectId);
+  const url = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/jobs/${jobId}/artifacts/tree`
+  );
+
+  Object.entries(options).forEach(([key, value]) => {
+    if (value !== undefined) {
+      if (typeof value === "boolean") {
+        url.searchParams.append(key, value ? "true" : "false");
+      } else {
+        url.searchParams.append(key, value.toString());
+      }
+    }
+  });
+
+  const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
+  });
+
+  if (response.status === 404) {
+    throw new Error(`Job artifacts not found. The job may not have produced artifacts or the job ID is invalid.`);
+  }
+
+  await handleGitLabError(response);
+  const data = await response.json();
+  return z.array(GitLabArtifactEntrySchema).parse(data);
+}
+
+/**
+ * Download the entire artifact archive for a job and save to disk
+ *
+ * @param {string} projectId - The ID or URL-encoded path of the project
+ * @param {string} jobId - The ID of the job
+ * @param {string} localPath - Optional local directory to save the archive
+ * @returns {Promise<string>} The path where the artifact archive was saved
+ */
+async function downloadJobArtifacts(
+  projectId: string,
+  jobId: string,
+  localPath?: string
+): Promise<string> {
+  projectId = decodeURIComponent(projectId);
+  const effectiveProjectId = getEffectiveProjectId(projectId);
+
+  const url = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(effectiveProjectId)}/jobs/${jobId}/artifacts`
+  );
+
+  const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
+  });
+
+  if (response.status === 404) {
+    throw new Error(`Job artifacts not found. The job may not have produced artifacts or the job ID is invalid.`);
+  }
+
+  await handleGitLabError(response);
+
+  const buffer = await response.arrayBuffer();
+  const filename = `artifacts_job_${jobId}.zip`;
+  const savePath = localPath ? path.join(localPath, filename) : filename;
+  fs.mkdirSync(path.dirname(savePath), { recursive: true });
+
+  fs.writeFileSync(savePath, Buffer.from(buffer));
+
+  return savePath;
+}
+
+/**
+ * Download a single file from a job's artifacts
+ *
+ * @param {string} projectId - The ID or URL-encoded path of the project
+ * @param {string} jobId - The ID of the job
+ * @param {string} artifactPath - Path to the file within the artifacts archive
+ * @returns {Promise<string>} The file content as text
+ */
+async function getJobArtifactFile(
+  projectId: string,
+  jobId: string,
+  artifactPath: string
+): Promise<string> {
+  projectId = decodeURIComponent(projectId);
+  const effectiveProjectId = getEffectiveProjectId(projectId);
+  const encodedArtifactPath = artifactPath
+    .split("/")
+    .map(segment => encodeURIComponent(segment))
+    .join("/");
+
+  const url = new URL(
+    `${getEffectiveApiUrl()}/projects/${encodeURIComponent(effectiveProjectId)}/jobs/${jobId}/artifacts/${encodedArtifactPath}`
+  );
+
+  const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
+  });
+
+  if (response.status === 404) {
+    throw new Error(`Artifact file not found: ${artifactPath}`);
+  }
+
+  await handleGitLabError(response);
+
+  return await response.text();
+}
+
+/**
  * Create a new pipeline
  *
  * @param {string} projectId - The ID or URL-encoded path of the project
  * @param {string} ref - The branch or tag to run the pipeline on
  * @param {Array} variables - Optional variables for the pipeline
+ * @param {Record<string, string>} inputs - Optional input parameters for the pipeline
  * @returns {Promise<GitLabPipeline>} The created pipeline
  */
 async function createPipeline(
   projectId: string,
   ref: string,
-  variables?: Array<{ key: string; value: string }>
+  variables?: Array<{ key: string; value: string }>,
+  inputs?: Record<string, string>
 ): Promise<GitLabPipeline> {
   projectId = decodeURIComponent(projectId); // Decode project ID
   const url = new URL(
@@ -4246,13 +6553,13 @@ async function createPipeline(
   if (variables && variables.length > 0) {
     body.variables = variables;
   }
+  if (inputs && Object.keys(inputs).length > 0) {
+    body.inputs = inputs;
+  }
 
   const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
     method: "POST",
-    headers: {
-      ...BASE_HEADERS,
-      ...buildAuthHeaders(),
-    },
     body: JSON.stringify(body),
   });
 
@@ -4278,11 +6585,8 @@ async function retryPipeline(
   );
 
   const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
     method: "POST",
-    headers: {
-      ...BASE_HEADERS,
-      ...buildAuthHeaders(),
-    },
   });
 
   await handleGitLabError(response);
@@ -4307,11 +6611,8 @@ async function cancelPipeline(
   );
 
   const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
     method: "POST",
-    headers: {
-      ...BASE_HEADERS,
-      ...buildAuthHeaders(),
-    },
   });
 
   await handleGitLabError(response);
@@ -4427,17 +6728,11 @@ async function getRepositoryTree(options: GetRepositoryTreeOptions): Promise<Git
   if (options.page_token) queryParams.append("page_token", options.page_token);
   if (options.pagination) queryParams.append("pagination", options.pagination);
 
-  const headers: Record<string, string> = {
-    ...BASE_HEADERS,
-    ...buildAuthHeaders(),
-  };
   const response = await fetch(
     `${getEffectiveApiUrl()}/projects/${encodeURIComponent(
       getEffectiveProjectId(options.project_id)
     )}/repository/tree?${queryParams.toString()}`,
-    {
-      headers,
-    }
+    { ...getFetchConfig() }
   );
 
   if (response.status === 404) {
@@ -5019,15 +7314,13 @@ async function markdownUpload(projectId: string, filePath: string): Promise<GitL
     `${getEffectiveApiUrl()}/projects/${encodeURIComponent(effectiveProjectId)}/uploads`
   );
 
+  const defaultFetchConfig = getFetchConfig();
+  delete defaultFetchConfig.headers["Content-Type"]; // Let form-data set the correct Content-Type with boundary
+
   const response = await fetch(url.toString(), {
+    ...defaultFetchConfig,
     method: "POST",
-    headers: {
-      ...BASE_HEADERS,
-      ...buildAuthHeaders(),
-      // Remove Content-Type header to let form-data set it with boundary
-      "Content-Type": undefined as any,
-    },
-    body: form,
+    body: form
   });
 
   if (!response.ok) {
@@ -5038,12 +7331,35 @@ async function markdownUpload(projectId: string, filePath: string): Promise<GitL
   return GitLabMarkdownUploadSchema.parse(data);
 }
 
+const IMAGE_MIME_TYPES: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+  ".bmp": "image/bmp",
+  ".ico": "image/x-icon",
+};
+
+function getImageMimeType(filename: string): string | null {
+  const ext = path.extname(filename).toLowerCase();
+  return IMAGE_MIME_TYPES[ext] ?? null;
+}
+
+interface DownloadAttachmentResult {
+  buffer: Buffer;
+  filename: string;
+  mimeType: string | null;
+  savedPath?: string;
+}
+
 async function downloadAttachment(
   projectId: string,
   secret: string,
   filename: string,
   localPath?: string
-): Promise<string> {
+): Promise<DownloadAttachmentResult> {
   const effectiveProjectId = getEffectiveProjectId(projectId);
 
   const url = new URL(
@@ -5051,11 +7367,8 @@ async function downloadAttachment(
   );
 
   const response = await fetch(url.toString(), {
+    ...getFetchConfig(),
     method: "GET",
-    headers: {
-      ...BASE_HEADERS,
-      ...buildAuthHeaders(),
-    },
   });
 
   if (!response.ok) {
@@ -5063,15 +7376,36 @@ async function downloadAttachment(
   }
 
   // Get the file content as buffer
-  const buffer = await response.arrayBuffer();
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const mimeType = getImageMimeType(filename);
 
-  // Determine the save path
-  const savePath = localPath ? path.join(localPath, filename) : filename;
+  // For non-image files, always save to disk.
+  // For image files, only save to disk if local_path is explicitly provided.
+  if (!mimeType || localPath) {
+    let savePath: string;
+    if (localPath) {
+      const normalizedLocalPath = path.normalize(localPath);
+      if (
+        path.isAbsolute(normalizedLocalPath) ||
+        normalizedLocalPath === ".." ||
+        normalizedLocalPath.startsWith(".." + path.sep) ||
+        normalizedLocalPath.includes(path.sep + ".." + path.sep)
+      ) {
+        throw new Error("Invalid local_path: directory traversal is not allowed.");
+      }
+      savePath = path.join(normalizedLocalPath, filename);
+    } else {
+      savePath = filename;
+    }
+    const dir = path.dirname(savePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(savePath, buffer);
+    return { buffer, filename, mimeType, savedPath: savePath };
+  }
 
-  // Write the file to disk
-  fs.writeFileSync(savePath, Buffer.from(buffer));
-
-  return savePath;
+  return { buffer, filename, mimeType };
 }
 
 /**
@@ -5089,13 +7423,7 @@ async function listEvents(options: z.infer<typeof ListEventsSchema> = {}): Promi
     }
   });
 
-  const response = await fetch(url.toString(), {
-    method: "GET",
-    headers: {
-      ...BASE_HEADERS,
-      ...buildAuthHeaders(),
-    },
-  });
+  const response = await fetch(url.toString(), { ...getFetchConfig() });
 
   if (!response.ok) {
     await handleGitLabError(response);
@@ -5127,13 +7455,7 @@ async function getProjectEvents(
     }
   });
 
-  const response = await fetch(url.toString(), {
-    method: "GET",
-    headers: {
-      ...BASE_HEADERS,
-      ...buildAuthHeaders(),
-    },
-  });
+  const response = await fetch(url.toString(), { ...getFetchConfig() });
 
   if (!response.ok) {
     await handleGitLabError(response);
@@ -5337,97 +7659,8 @@ async function downloadReleaseAsset(
   return await response.text();
 }
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  // Apply read-only filter first
-  const tools0 = GITLAB_READ_ONLY_MODE
-    ? allTools.filter(tool => readOnlyTools.has(tool.name))
-    : allTools;
-  // Toggle wiki tools by USE_GITLAB_WIKI flag
-  const tools1 = USE_GITLAB_WIKI ? tools0 : tools0.filter(tool => !wikiToolNames.has(tool.name));
-  // Toggle milestone tools by USE_MILESTONE flag
-  const tools2 = USE_MILESTONE ? tools1 : tools1.filter(tool => !milestoneToolNames.has(tool.name));
-  // Toggle pipeline tools by USE_PIPELINE flag
-  let tools = USE_PIPELINE ? tools2 : tools2.filter(tool => !pipelineToolNames.has(tool.name));
-  tools = GITLAB_DENIED_TOOLS_REGEX
-    ? tools.filter(tool => !GITLAB_DENIED_TOOLS_REGEX.test(tool.name))
-    : tools;
-
-  // <<< START: Gemini 호환성을 위해 $schema 제거 >>>
-  tools = tools.map(tool => {
-    // inputSchema가 존재하고 객체인지 확인
-    if (tool.inputSchema && typeof tool.inputSchema === "object" && tool.inputSchema !== null) {
-      // $schema 키가 존재하면 삭제
-      if ("$schema" in tool.inputSchema) {
-        // 불변성을 위해 새로운 객체 생성 (선택적이지만 권장)
-        const modifiedSchema = { ...tool.inputSchema };
-        delete modifiedSchema.$schema;
-        return { ...tool, inputSchema: modifiedSchema };
-      }
-    }
-    // 변경이 필요 없으면 그대로 반환
-    return tool;
-  });
-  // <<< END: Gemini 호환성을 위해 $schema 제거 >>>
-
-  return {
-    tools, // $schema가 제거된 도구 목록 반환
-  };
-});
-
-server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
-  // Manually retrieve the session context using the session ID passed in the request.
-  // This is a robust workaround for AsyncLocalStorage context loss.
-  const sessionId = request.params.sessionId;
-  if (REMOTE_AUTHORIZATION && sessionId && authBySession[sessionId]) {
-    const authData = authBySession[sessionId];
-    const sessionContext: SessionAuth = {
-      sessionId,
-      header: authData.header,
-      token: authData.token,
-      lastUsed: authData.lastUsed,
-      apiUrl: authData.apiUrl,
-    };
-    // Run the handler within the retrieved context
-    return await sessionAuthStore.run(sessionContext, () => handleToolCall(request.params));
-  }
-  // Fallback for non-remote-auth mode or if session is not found
-  return handleToolCall(request.params);
-});
-
-/**
- * Filter diffs by excluded file patterns
- * Safely handles invalid regex patterns by logging and ignoring them
- *
- * @param diffs - Array of diff objects with new_path property
- * @param excludedFilePatterns - Array of regex patterns to exclude
- * @returns Filtered array of diffs
- */
-function filterDiffsByPatterns<T extends { new_path: string }>(
-  diffs: T[],
-  excludedFilePatterns: string[] | undefined
-): T[] {
-  if (!excludedFilePatterns?.length) return diffs;
-
-  const regexPatterns = excludedFilePatterns
-    .map((pattern) => {
-      try {
-        return new RegExp(pattern);
-      } catch (e) {
-        console.warn(`Invalid regex pattern ignored: ${pattern}`);
-        return null;
-      }
-    })
-    .filter((regex): regex is RegExp => regex !== null);
-
-  if (regexPatterns.length === 0) return diffs;
-
-  const matchesAnyPattern = (path: string): boolean => {
-    if (!path) return false;
-    return regexPatterns.some((regex) => regex.test(path));
-  };
-
-  return diffs.filter((diff) => !matchesAnyPattern(diff.new_path));
-}
+// Request handlers are now registered inside createServer() factory function
+// to ensure each transport connection gets its own Server instance (GHSA-345p-7cg4-v4c7).
 
 async function handleToolCall(params: any) {
   try {
@@ -5439,7 +7672,21 @@ async function handleToolCall(params: any) {
     if (GITLAB_AUTH_COOKIE_PATH) {
       await ensureSessionForRequest();
     }
-    logger.info(params.name);
+
+    // Lazy OAuth token refresh: only validate/refresh when a tool is actually called
+    await ensureValidOAuthToken();
+
+    // Normalize common parameter aliases that LLMs send
+    const args = params.arguments as Record<string, unknown>;
+    if (args) {
+      // work_item_iid -> iid (for work item tools)
+      if (args.work_item_iid !== undefined && args.iid === undefined) {
+        args.iid = args.work_item_iid;
+        delete args.work_item_iid;
+      }
+    }
+
+    logger.info({ tool: params.name, event: "tool_call_start" }, `tool_call_start: ${params.name}`);
     switch (params.name) {
       case "execute_graphql": {
         const args = ExecuteGraphQLSchema.parse(params.arguments);
@@ -5544,6 +7791,54 @@ async function handleToolCall(params: any) {
       case "search_repositories": {
         const args = SearchRepositoriesSchema.parse(params.arguments);
         const results = await searchProjects(args.search, args.page, args.per_page);
+        return {
+          content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+        };
+      }
+
+      case "search_code": {
+        const args = SearchCodeSchema.parse(params.arguments);
+        const results = await searchBlobs({
+          search: args.search,
+          filename: args.filename,
+          path: args.path,
+          extension: args.extension,
+          page: args.page,
+          per_page: args.per_page,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+        };
+      }
+
+      case "search_project_code": {
+        const args = SearchProjectCodeSchema.parse(params.arguments);
+        const results = await searchBlobs({
+          search: args.search,
+          project_id: args.project_id,
+          ref: args.ref,
+          filename: args.filename,
+          path: args.path,
+          extension: args.extension,
+          page: args.page,
+          per_page: args.per_page,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+        };
+      }
+
+      case "search_group_code": {
+        const args = SearchGroupCodeSchema.parse(params.arguments);
+        const results = await searchBlobs({
+          search: args.search,
+          group_id: args.group_id,
+          filename: args.filename,
+          path: args.path,
+          extension: args.extension,
+          page: args.page,
+          per_page: args.per_page,
+        });
         return {
           content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
         };
@@ -5701,7 +7996,9 @@ async function handleToolCall(params: any) {
           args.project_id,
           args.merge_request_iid,
           args.sort,
-          args.order_by
+          args.order_by,
+          args.per_page,
+          args.page
         );
 
         return {
@@ -5730,7 +8027,8 @@ async function handleToolCall(params: any) {
           args.issue_iid,
           args.discussion_id,
           args.note_id,
-          args.body
+          args.body,
+          args.resolved
         );
         return {
           content: [{ type: "text", text: JSON.stringify(note, null, 2) }],
@@ -5758,8 +8056,31 @@ async function handleToolCall(params: any) {
           args.merge_request_iid,
           args.source_branch
         );
+        const deploymentSummary = await buildMergeRequestDeploymentSummary(
+          args.project_id,
+          mergeRequest
+        );
+        const commitAdditionSummary = await buildMergeRequestCommitAdditionSummary(
+          args.project_id,
+          mergeRequest
+        );
+        const approvalSummary = await buildMergeRequestApprovalSummary(
+          args.project_id,
+          mergeRequest.iid
+        );
+        const mergeRequestWithDeploymentSummary: GitLabMergeRequestWithDeploymentSummary = {
+          ...mergeRequest,
+          deployment_summary: deploymentSummary,
+          commit_addition_summary: commitAdditionSummary,
+          approval_summary: approvalSummary,
+        };
         return {
-          content: [{ type: "text", text: JSON.stringify(mergeRequest, null, 2) }],
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(mergeRequestWithDeploymentSummary, null, 2),
+            },
+          ],
         };
       }
 
@@ -5774,6 +8095,19 @@ async function handleToolCall(params: any) {
         const filteredDiffs = filterDiffsByPatterns(diffs, args.excluded_file_patterns);
         return {
           content: [{ type: "text", text: JSON.stringify(filteredDiffs, null, 2) }],
+        };
+      }
+
+      case "list_merge_request_changed_files": {
+        const args = ListMergeRequestChangedFilesSchema.parse(params.arguments);
+        const files = await listMergeRequestChangedFiles(
+          args.project_id,
+          args.merge_request_iid,
+          args.source_branch,
+          args.excluded_file_patterns
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(files, null, 2) }],
         };
       }
 
@@ -5792,12 +8126,23 @@ async function handleToolCall(params: any) {
         };
       }
 
+      case "get_merge_request_file_diff": {
+        const args = GetMergeRequestFileDiffSchema.parse(params.arguments);
+        const fileDiff = await getMergeRequestFileDiff(
+          args.project_id,
+          args.file_paths,
+          args.merge_request_iid,
+          args.source_branch,
+          args.unidiff
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(fileDiff, null, 2) }],
+        };
+      }
+
       case "list_merge_request_versions": {
         const args = ListMergeRequestVersionsSchema.parse(params.arguments);
-        const versions = await listMergeRequestVersions(
-          args.project_id,
-          args.merge_request_iid
-        );
+        const versions = await listMergeRequestVersions(args.project_id, args.merge_request_iid);
         return {
           content: [{ type: "text", text: JSON.stringify(versions, null, 2) }],
         };
@@ -5868,6 +8213,17 @@ async function handleToolCall(params: any) {
         );
         return {
           content: [{ type: "text", text: JSON.stringify(approvalState, null, 2) }],
+        };
+      }
+
+      case "get_merge_request_conflicts": {
+        const args = GetMergeRequestConflictsSchema.parse(params.arguments);
+        const conflicts = await getMergeRequestConflicts(
+          args.project_id,
+          args.merge_request_iid
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(conflicts, null, 2) }],
         };
       }
 
@@ -6038,12 +8394,13 @@ async function handleToolCall(params: any) {
 
       case "create_draft_note": {
         const args = CreateDraftNoteSchema.parse(params.arguments);
-        const { project_id, merge_request_iid, body, position, resolve_discussion } = args;
+        const { project_id, merge_request_iid, body, in_reply_to_discussion_id, position, resolve_discussion } = args;
 
         const draftNote = await createDraftNote(
           project_id,
           merge_request_iid,
           body,
+          in_reply_to_discussion_id,
           position,
           resolve_discussion
         );
@@ -6236,6 +8593,115 @@ async function handleToolCall(params: any) {
         };
       }
 
+      case "get_work_item": {
+        const args = GetWorkItemSchema.parse(params.arguments);
+        const result = await getWorkItem(args.project_id, args.iid);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "list_work_items": {
+        const args = ListWorkItemsSchema.parse(params.arguments);
+        const { project_id, ...options } = args;
+        const result = await listWorkItems(project_id, options);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "create_work_item": {
+        const args = CreateWorkItemSchema.parse(params.arguments);
+        const { project_id, ...options } = args;
+        const result = await createWorkItem(project_id, options);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "update_work_item": {
+        const args = UpdateWorkItemSchema.parse(params.arguments);
+        const { project_id, iid, ...options } = args;
+        const result = await updateWorkItem(project_id, iid, options);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "convert_work_item_type": {
+        const args = ConvertWorkItemTypeSchema.parse(params.arguments);
+        const result = await convertIssueType(
+          args.project_id,
+          args.iid,
+          args.new_type
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "list_work_item_statuses": {
+        const args = ListWorkItemStatusesSchema.parse(params.arguments);
+        const result = await listIssueStatuses(args.project_id, args.work_item_type);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "list_custom_field_definitions": {
+        const args = ListCustomFieldDefinitionsSchema.parse(params.arguments);
+        const result = await listCustomFieldDefinitions(args.project_id, args.work_item_type);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "move_work_item": {
+        const args = MoveWorkItemSchema.parse(params.arguments);
+        const result = await moveWorkItem(args.project_id, args.iid, args.target_project_id);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "list_work_item_notes": {
+        const args = ListWorkItemNotesSchema.parse(params.arguments);
+        const result = await listWorkItemNotes(args.project_id, args.iid, args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "create_work_item_note": {
+        const args = CreateWorkItemNoteSchema.parse(params.arguments);
+        const result = await createWorkItemNote(args.project_id, args.iid, args.body, args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "get_timeline_events": {
+        const args = GetTimelineEventsSchema.parse(params.arguments);
+        const result = await getTimelineEvents(args.project_id, args.incident_iid);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "create_timeline_event": {
+        const args = CreateTimelineEventSchema.parse(params.arguments);
+        const result = await createTimelineEvent(
+          args.project_id,
+          args.incident_iid,
+          args.note,
+          args.occurred_at,
+          args.tag_names
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
       case "list_labels": {
         const args = ListLabelsSchema.parse(params.arguments);
         const labels = await listLabels(args.project_id, args);
@@ -6354,6 +8820,68 @@ async function handleToolCall(params: any) {
         };
       }
 
+      case "list_group_wiki_pages": {
+        const { group_id, page, per_page, with_content } = ListGroupWikiPagesSchema.parse(
+          params.arguments
+        );
+        const wikiPages = await listGroupWikiPages(group_id, {
+          page,
+          per_page,
+          with_content,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(wikiPages, null, 2) }],
+        };
+      }
+
+      case "get_group_wiki_page": {
+        const { group_id, slug } = GetGroupWikiPageSchema.parse(params.arguments);
+        const wikiPage = await getGroupWikiPage(group_id, slug);
+        return {
+          content: [{ type: "text", text: JSON.stringify(wikiPage, null, 2) }],
+        };
+      }
+
+      case "create_group_wiki_page": {
+        const { group_id, title, content, format } = CreateGroupWikiPageSchema.parse(
+          params.arguments
+        );
+        const wikiPage = await createGroupWikiPage(group_id, title, content, format);
+        return {
+          content: [{ type: "text", text: JSON.stringify(wikiPage, null, 2) }],
+        };
+      }
+
+      case "update_group_wiki_page": {
+        const { group_id, slug, title, content, format } = UpdateGroupWikiPageSchema.parse(
+          params.arguments
+        );
+        const wikiPage = await updateGroupWikiPage(group_id, slug, title, content, format);
+        return {
+          content: [{ type: "text", text: JSON.stringify(wikiPage, null, 2) }],
+        };
+      }
+
+      case "delete_group_wiki_page": {
+        const { group_id, slug } = DeleteGroupWikiPageSchema.parse(params.arguments);
+        await deleteGroupWikiPage(group_id, slug);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "success",
+                  message: "Group wiki page deleted successfully",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
       case "get_repository_tree": {
         const args = GetRepositoryTreeSchema.parse(params.arguments);
         const tree = await getRepositoryTree(args);
@@ -6381,6 +8909,40 @@ async function handleToolCall(params: any) {
               text: JSON.stringify(pipeline, null, 2),
             },
           ],
+        };
+      }
+
+      case "list_deployments": {
+        const args = ListDeploymentsSchema.parse(params.arguments);
+        const { project_id, ...options } = args;
+        const deployments = await listDeployments(project_id, options);
+        return {
+          content: [{ type: "text", text: JSON.stringify(deployments, null, 2) }],
+        };
+      }
+
+      case "get_deployment": {
+        const { project_id, deployment_id } = GetDeploymentSchema.parse(params.arguments);
+        const deployment = await getDeployment(project_id, deployment_id);
+        return {
+          content: [{ type: "text", text: JSON.stringify(deployment, null, 2) }],
+        };
+      }
+
+      case "list_environments": {
+        const args = ListEnvironmentsSchema.parse(params.arguments);
+        const { project_id, ...options } = args;
+        const environments = await listEnvironments(project_id, options);
+        return {
+          content: [{ type: "text", text: JSON.stringify(environments, null, 2) }],
+        };
+      }
+
+      case "get_environment": {
+        const { project_id, environment_id } = GetEnvironmentSchema.parse(params.arguments);
+        const environment = await getEnvironment(project_id, environment_id);
+        return {
+          content: [{ type: "text", text: JSON.stringify(environment, null, 2) }],
         };
       }
 
@@ -6443,8 +9005,8 @@ async function handleToolCall(params: any) {
       }
 
       case "create_pipeline": {
-        const { project_id, ref, variables } = CreatePipelineSchema.parse(params.arguments);
-        const pipeline = await createPipeline(project_id, ref, variables);
+        const { project_id, ref, variables, inputs } = CreatePipelineSchema.parse(params.arguments);
+        const pipeline = await createPipeline(project_id, ref, variables, inputs);
         return {
           content: [
             {
@@ -6522,9 +9084,68 @@ async function handleToolCall(params: any) {
         };
       }
 
+      case "list_job_artifacts": {
+        const { project_id, job_id, ...options } = ListJobArtifactsSchema.parse(
+          params.arguments
+        );
+        const artifacts = await listJobArtifacts(project_id, job_id, options);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(artifacts, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "download_job_artifacts": {
+        const { project_id, job_id, local_path } = DownloadJobArtifactsSchema.parse(
+          params.arguments
+        );
+        const filePath = await downloadJobArtifacts(project_id, job_id, local_path);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ success: true, file_path: filePath }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "get_job_artifact_file": {
+        const { project_id, job_id, artifact_path } = GetJobArtifactFileSchema.parse(
+          params.arguments
+        );
+        const fileContent = await getJobArtifactFile(project_id, job_id, artifact_path);
+        return {
+          content: [
+            {
+              type: "text",
+              text: fileContent,
+            },
+          ],
+        };
+      }
+
       case "list_merge_requests": {
-        const args = ListMergeRequestsSchema.parse(params.arguments);
-        const mergeRequests = await listMergeRequests(args.project_id, args);
+        const { project_id, ...options } = ListMergeRequestsSchema.parse(params.arguments);
+
+        // GitLab API treats _id and _username as mutually exclusive for these fields.
+        // When both are provided, prefer _username and remove _id to avoid 400 errors.
+        const cleanedOptions = { ...options } as Record<string, unknown>;
+        if (cleanedOptions.author_id && cleanedOptions.author_username) {
+          delete cleanedOptions.author_id;
+        }
+        if (cleanedOptions.assignee_id && cleanedOptions.assignee_username) {
+          delete cleanedOptions.assignee_id;
+        }
+        if (cleanedOptions.reviewer_id && cleanedOptions.reviewer_username) {
+          delete cleanedOptions.reviewer_id;
+        }
+
+        const mergeRequests = await listMergeRequests(project_id, cleanedOptions);
         return {
           content: [{ type: "text", text: JSON.stringify(mergeRequests, null, 2) }],
         };
@@ -6702,15 +9323,33 @@ async function handleToolCall(params: any) {
 
       case "download_attachment": {
         const args = DownloadAttachmentSchema.parse(params.arguments);
-        const filePath = await downloadAttachment(
+        const result = await downloadAttachment(
           args.project_id,
           args.secret,
           args.filename,
           args.local_path
         );
+
+        if (result.mimeType && !args.local_path) {
+          // Return image inline as base64 so the AI can see it
+          const base64 = result.buffer.toString("base64");
+          return {
+            content: [
+              { type: "image", data: base64, mimeType: result.mimeType },
+              {
+                type: "text",
+                text: JSON.stringify({ filename: result.filename, mimeType: result.mimeType }, null, 2),
+              },
+            ],
+          };
+        }
+
         return {
           content: [
-            { type: "text", text: JSON.stringify({ success: true, file_path: filePath }, null, 2) },
+            {
+              type: "text",
+              text: JSON.stringify({ success: true, file_path: result.savedPath }, null, 2),
+            },
           ],
         };
       }
@@ -6817,6 +9456,47 @@ async function handleToolCall(params: any) {
         };
       }
 
+      case "list_webhooks": {
+        const args = ListWebhooksSchema.parse(params.arguments);
+        const webhooks = await listWebhooks(args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(webhooks, null, 2) }],
+        };
+      }
+
+      case "list_webhook_events": {
+        const args = ListWebhookEventsSchema.parse(params.arguments);
+        const events = await listWebhookEvents(args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(events, null, 2) }],
+        };
+      }
+
+      case "get_webhook_event": {
+        const args = GetWebhookEventSchema.parse(params.arguments);
+        const event = await getWebhookEvent(args);
+        if (!event) {
+          const searchScope = args.page
+            ? `on page ${args.page}`
+            : "in the 500 most recent events";
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { error: `Webhook event ${args.event_id} not found ${searchScope}` },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify(event, null, 2) }],
+        };
+      }
+
       default:
         throw new Error(`Unknown tool: ${params.name}`);
     }
@@ -6866,8 +9546,13 @@ function determineTransportMode(): TransportMode {
  * Start server with stdio transport
  */
 async function startStdioServer(): Promise<void> {
+  const serverInstance = createServer();
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  transport.onclose = () => {
+    logger.info("Stdio transport closed, releasing client pool");
+    clientPool.closeAll();
+  };
+  await serverInstance.connect(transport);
 }
 
 /**
@@ -6876,14 +9561,16 @@ async function startStdioServer(): Promise<void> {
 async function startSSEServer(): Promise<void> {
   const app = express();
   const transports: { [sessionId: string]: SSEServerTransport } = {};
+  let shuttingDown = false;
 
   app.get("/sse", async (_: Request, res: Response) => {
+    const serverInstance = createServer();
     const transport = new SSEServerTransport("/messages", res);
     transports[transport.sessionId] = transport;
     res.on("close", () => {
       delete transports[transport.sessionId];
     });
-    await server.connect(transport);
+    await serverInstance.connect(transport);
   });
 
   app.post("/messages", async (req: Request, res: Response) => {
@@ -6904,11 +9591,34 @@ async function startSSEServer(): Promise<void> {
     });
   });
 
-  app.listen(Number(PORT), HOST, () => {
-    logger.info(`GitLab MCP Server running with SSE transport`);
-    const colorGreen = "\x1b[32m";
-    const colorReset = "\x1b[0m";
+  const httpServer = app.listen(Number(PORT), HOST, () => {
+    logger.info("GitLab MCP Server running with SSE transport");
     logger.info(`${colorGreen}Endpoint: http://${HOST}:${PORT}/sse${colorReset}`);
+  });
+
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info(`${signal} received, shutting down SSE server...`);
+    httpServer.close(() => logger.info("SSE HTTP server closed"));
+    await Promise.allSettled(
+      Object.values(transports).map(async transport => {
+        try {
+          await transport.close();
+        } catch (error) {
+          logger.error("Error closing SSE transport:", error);
+        }
+      })
+    );
+    clientPool.closeAll();
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT");
   });
 }
 
@@ -6972,12 +9682,26 @@ async function startStreamableHTTPServer(): Promise<void> {
   };
 
   /**
+   * Check whether the request carries a raw header auth token (Private-Token or JOB-TOKEN).
+   * Used to decide whether to bypass OAuth validation.
+   */
+  const hasHeaderAuth = (req: Request): boolean => {
+    return !!(
+      (req.headers["private-token"] as string | undefined) ||
+      (req.headers["job-token"] as string | undefined)
+    );
+  };
+
+  /**
    * Parse authentication from request headers
    * Returns null if no auth found or invalid format
+   * Supports: Private-Token header, JOB-TOKEN header, Authorization Bearer header
+   * Priority: Private-Token > JOB-TOKEN > Authorization Bearer
    */
   const parseAuthHeaders = (req: Request): AuthData | null => {
     const authHeader = (req.headers["authorization"] as string | undefined) || "";
     const privateToken = (req.headers["private-token"] as string | undefined) || "";
+    const jobToken = (req.headers["job-token"] as string | undefined) || "";
     const dynamicApiUrl = (req.headers["x-gitlab-api-url"] as string | undefined)?.trim();
 
     let apiUrl = GITLAB_API_URL; // Default API URL
@@ -6993,13 +9717,17 @@ async function startStreamableHTTPServer(): Promise<void> {
       }
     }
 
-    // Extract token
+    // Extract token — priority: Private-Token > JOB-TOKEN > Authorization Bearer
+    // PATs are preferred over job tokens because they carry broader permissions.
     let token: string | null = null;
-    let header: "Authorization" | "Private-Token" | null = null;
+    let header: "Authorization" | "Private-Token" | "JOB-TOKEN" | null = null;
 
     if (privateToken) {
       token = privateToken.trim();
       header = "Private-Token";
+    } else if (jobToken) {
+      token = jobToken.trim();
+      header = "JOB-TOKEN";
     } else if (authHeader) {
       // Use \S+ instead of .+ to prevent ReDoS attacks
       // \S+ only matches non-whitespace, so trim() is technically unnecessary,
@@ -7063,15 +9791,76 @@ async function startStreamableHTTPServer(): Promise<void> {
   // Configure Express middleware
   app.use(express.json());
 
+  // MCP OAuth — mount auth router and prepare bearer-auth middleware
+  if (GITLAB_MCP_OAUTH) {
+    // Trust first proxy so express-rate-limit uses X-Forwarded-For for real client IP.
+    // Only enabled in OAuth mode where the server is typically behind a reverse proxy.
+    app.set("trust proxy", 1);
+    const gitlabBaseUrl = GITLAB_API_URL.replace(/\/api\/v4\/?$/, "").replace(/\/$/, "");
+    const issuerUrl = new URL(MCP_SERVER_URL!);
+    const oauthProvider = createGitLabOAuthProvider(gitlabBaseUrl, GITLAB_OAUTH_APP_ID!, "GitLab MCP Server", GITLAB_READ_ONLY_MODE, GITLAB_OAUTH_SCOPES);
+
+    // Mounts /.well-known/oauth-authorization-server,
+    //        /.well-known/oauth-protected-resource,
+    //        /authorize, /token, /register, /revoke
+    app.use(
+      mcpAuthRouter({
+        provider: oauthProvider,
+        issuerUrl,
+        baseUrl: issuerUrl,
+        scopesSupported: GITLAB_OAUTH_SCOPES ?? ["api", "read_api", "read_user"],
+        resourceName: "GitLab MCP Server",
+      })
+    );
+
+    // Expose provider so the /mcp route middleware can reference it
+    (app as any)._mcpOAuthProvider = oauthProvider;
+  }
+
+  // Build bearer-auth middleware — no-op unless GITLAB_MCP_OAUTH is enabled.
+  // Unauthenticated requests receive 401 + WWW-Authenticate header, which is
+  // exactly what Claude.ai needs to trigger the OAuth browser flow.
+  //
+  // Header auth fallback: if Private-Token or JOB-TOKEN headers are present,
+  // OAuth validation is skipped and the raw token is used directly per-session.
+  // Note: Authorization: Bearer is always treated as an OAuth token and goes
+  // through OAuth validation — use Private-Token for PAT-based header auth.
+  const oauthBearerAuth = GITLAB_MCP_OAUTH
+    ? requireBearerAuth({
+        verifier: (app as any)._mcpOAuthProvider,
+        requiredScopes: [],
+      })
+    : undefined;
+  const mcpBearerAuth = GITLAB_MCP_OAUTH
+    ? (req: Request, res: Response, next: NextFunction) => {
+        const privateToken = (req.headers["private-token"] as string | undefined) || "";
+        const jobToken = (req.headers["job-token"] as string | undefined) || "";
+        if (privateToken || jobToken) {
+          // Validate the raw token before bypassing OAuth
+          const authData = parseAuthHeaders(req);
+          if (authData) {
+            next();
+            return;
+          }
+          res.status(401).json({
+            error: "Invalid Private-Token or JOB-TOKEN header",
+            message: "The provided token failed validation. Check the token value and format.",
+          });
+          return;
+        }
+        oauthBearerAuth!(req, res, next);
+      }
+    : (_req: Request, _res: Response, next: NextFunction) => next();
+
   // Streamable HTTP endpoint - handles both session creation and message handling
-  app.post("/mcp", async (req: Request, res: Response) => {
+  app.post("/mcp", mcpBearerAuth, async (req: Request, res: Response) => {
     const sessionId = req.headers["mcp-session-id"] as string;
 
     // Track request
     metrics.requestsProcessed++;
 
     // Rate limiting check for existing sessions
-    if (REMOTE_AUTHORIZATION && sessionId && !checkRateLimit(sessionId)) {
+    if ((REMOTE_AUTHORIZATION || GITLAB_MCP_OAUTH) && sessionId && !checkRateLimit(sessionId)) {
       metrics.rejectedByRateLimit++;
       res.status(429).json({
         error: "Rate limit exceeded",
@@ -7099,9 +9888,9 @@ async function startStreamableHTTPServer(): Promise<void> {
         if (!authData) {
           metrics.authFailures++;
           res.status(401).json({
-            error: "Missing Authorization or Private-Token header",
+            error: "Missing Private-Token, JOB-TOKEN, or Authorization header",
             message:
-              "Remote authorization is enabled. Please provide Authorization or Private-Token header.",
+              "Remote authorization is enabled. Please provide Private-Token, JOB-TOKEN, or Authorization header.",
           });
           return;
         }
@@ -7120,6 +9909,55 @@ async function startStreamableHTTPServer(): Promise<void> {
         setAuthTimeout(sessionId);
       } else if (!sessionId && !authData) {
         // First request without session - will fail in initialization
+      }
+    }
+
+    // MCP OAuth mode — either header auth (PAT/job token) or OAuth Bearer token.
+    // Header auth takes precedence: if Private-Token or JOB-TOKEN is present the
+    // OAuth middleware was bypassed and we store the raw token per-session.
+    // Otherwise req.auth is populated by requireBearerAuth; store the OAuth token.
+    if (GITLAB_MCP_OAUTH) {
+      const headerAuthData = hasHeaderAuth(req) ? parseAuthHeaders(req) : null;
+
+      if (headerAuthData) {
+        if (headerAuthData && sessionId) {
+          if (!authBySession[sessionId]) {
+            authBySession[sessionId] = headerAuthData;
+            logger.info(
+              `Session ${sessionId}: stored ${headerAuthData.header} header (header auth)`
+            );
+            setAuthTimeout(sessionId);
+          } else {
+            authBySession[sessionId] = {
+              ...authBySession[sessionId],
+              header: headerAuthData.header,
+              token: headerAuthData.token,
+              lastUsed: Date.now(),
+            };
+            setAuthTimeout(sessionId);
+          }
+        }
+      } else {
+        const authInfo = req.auth;
+        if (authInfo?.token && sessionId) {
+          if (!authBySession[sessionId]) {
+            authBySession[sessionId] = {
+              header: "Authorization",
+              token: authInfo.token,
+              lastUsed: Date.now(),
+              apiUrl: GITLAB_API_URL,
+            };
+            logger.info(
+              `Session ${sessionId}: stored OAuth token (client: ${authInfo.clientId})`
+            );
+            setAuthTimeout(sessionId);
+          } else {
+            // Update token on every request — the client may have refreshed it
+            authBySession[sessionId].token = authInfo.token;
+            authBySession[sessionId].lastUsed = Date.now();
+            setAuthTimeout(sessionId);
+          }
+        }
       }
     }
 
@@ -7152,6 +9990,35 @@ async function startStreamableHTTPServer(): Promise<void> {
                   setAuthTimeout(newSessionId);
                 }
               }
+
+              // Store OAuth token for newly created session in MCP OAuth mode.
+              // If Private-Token or JOB-TOKEN headers are present, prefer them.
+              if (GITLAB_MCP_OAUTH && !authBySession[newSessionId]) {
+                if (hasHeaderAuth(req)) {
+                  const authData = parseAuthHeaders(req);
+                  if (authData) {
+                    authBySession[newSessionId] = authData;
+                    logger.info(
+                      `Session ${newSessionId}: stored ${authData.header} header (header auth)`
+                    );
+                    setAuthTimeout(newSessionId);
+                  }
+                } else {
+                  const authInfo = req.auth;
+                  if (authInfo?.token) {
+                    authBySession[newSessionId] = {
+                      header: "Authorization",
+                      token: authInfo.token,
+                      lastUsed: Date.now(),
+                      apiUrl: GITLAB_API_URL,
+                    };
+                    logger.info(
+                      `Session ${newSessionId}: stored OAuth token (client: ${authInfo.clientId})`
+                    );
+                    setAuthTimeout(newSessionId);
+                  }
+                }
+              }
             },
           });
 
@@ -7162,7 +10029,7 @@ async function startStreamableHTTPServer(): Promise<void> {
               logger.warn(`Streamable HTTP transport closed for session ${sid}, cleaning up`);
               delete streamableTransports[sid];
               metrics.activeSessions--;
-              if (REMOTE_AUTHORIZATION) {
+              if (REMOTE_AUTHORIZATION || GITLAB_MCP_OAUTH) {
                 cleanupSessionAuth(sid);
                 delete sessionRequestCounts[sid];
                 logger.info(`Session ${sid}: cleaned up auth mapping`);
@@ -7170,8 +10037,10 @@ async function startStreamableHTTPServer(): Promise<void> {
             }
           };
 
-          // Connect transport to MCP server
-          await server.connect(transport);
+          // Create a new Server instance per session to prevent
+          // cross-client data leakage (GHSA-345p-7cg4-v4c7)
+          const serverInstance = createServer();
+          await serverInstance.connect(transport);
 
           // Handle the request - context is already set up in the outer handleRequest wrapper
           await transport.handleRequest(req, res, req.body);
@@ -7185,8 +10054,8 @@ async function startStreamableHTTPServer(): Promise<void> {
       }
     };
 
-    // Execute with auth context in remote mode
-    if (REMOTE_AUTHORIZATION && sessionId && authBySession[sessionId]) {
+    // Execute with auth context in remote mode (REMOTE_AUTHORIZATION or GITLAB_MCP_OAUTH)
+    if ((REMOTE_AUTHORIZATION || GITLAB_MCP_OAUTH) && sessionId && authBySession[sessionId]) {
       const authData = authBySession[sessionId];
       const ctx: SessionAuth = {
         sessionId,
@@ -7199,7 +10068,7 @@ async function startStreamableHTTPServer(): Promise<void> {
       // Run the entire request handling within AsyncLocalStorage context
       await sessionAuthStore.run(ctx, handleRequest);
     } else {
-      // Standard execution (no remote auth or no session yet)
+      // Standard execution (no per-session auth or no session yet)
       await handleRequest();
     }
   });
@@ -7220,6 +10089,7 @@ async function startStreamableHTTPServer(): Promise<void> {
       ...metrics,
       activeSessions: Object.keys(streamableTransports).length,
       authenticatedSessions: Object.keys(authBySession).length,
+      gitlabClientPool: clientPool.getStats(),
       uptime: process.uptime(),
       memoryUsage: process.memoryUsage(),
       config: {
@@ -7227,6 +10097,7 @@ async function startStreamableHTTPServer(): Promise<void> {
         maxRequestsPerMinute: MAX_REQUESTS_PER_MINUTE,
         sessionTimeoutSeconds: SESSION_TIMEOUT_SECONDS,
         remoteAuthEnabled: REMOTE_AUTHORIZATION,
+        mcpOAuthEnabled: GITLAB_MCP_OAUTH,
       },
     });
   });
@@ -7257,7 +10128,7 @@ async function startStreamableHTTPServer(): Promise<void> {
       try {
         await transport.close();
         logger.info(`Explicitly closed session via DELETE request: ${sessionId}`);
-        if (REMOTE_AUTHORIZATION) {
+        if (REMOTE_AUTHORIZATION || GITLAB_MCP_OAUTH) {
           cleanupSessionAuth(sessionId);
           delete sessionRequestCounts[sessionId];
           logger.info(`Session ${sessionId}: cleaned up auth mapping on DELETE`);
@@ -7296,7 +10167,7 @@ async function startStreamableHTTPServer(): Promise<void> {
         const transport = streamableTransports[sessionId];
         if (transport) {
           await transport.close();
-          if (REMOTE_AUTHORIZATION) {
+          if (REMOTE_AUTHORIZATION || GITLAB_MCP_OAUTH) {
             cleanupSessionAuth(sessionId);
             delete sessionRequestCounts[sessionId];
           }
@@ -7313,6 +10184,7 @@ async function startStreamableHTTPServer(): Promise<void> {
       clearAuthTimeout(sessionId);
     });
 
+    clientPool.closeAll();
     logger.info("Graceful shutdown complete");
     process.exit(0);
   };
@@ -7366,9 +10238,10 @@ async function runServer() {
       logger.info("Using OAuth authentication...");
       try {
         const gitlabBaseUrl = GITLAB_API_URL.replace(/\/api\/v4$/, "");
-        OAUTH_ACCESS_TOKEN = await initializeOAuth(gitlabBaseUrl);
+        const oauthResult = await initializeOAuthClient(gitlabBaseUrl);
+        oauthClient = oauthResult.client;
+        OAUTH_ACCESS_TOKEN = oauthResult.accessToken;
         logger.info("OAuth authentication successful");
-        // Note: Headers are automatically generated by buildAuthHeaders() using OAUTH_ACCESS_TOKEN
       } catch (error) {
         logger.error("OAuth authentication failed:", error);
         process.exit(1);

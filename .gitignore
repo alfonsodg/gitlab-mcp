@@ -7,8 +7,9 @@ build
 .env.test
 coverage/
 *.log
-test-results-oauth.json
-
 # ai
 .opencode*
 .aider*
+.sisyphus
+test-results*.json
+docs/plans/
